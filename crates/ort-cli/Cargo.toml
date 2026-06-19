@@ -1,0 +1,17 @@
+[package]
+name = "ort-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared CLI plumbing for ortc/ortd: arg fragments, logging init, key/cert loading"
+
+[dependencies]
+ort-core.workspace = true
+ort-net.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+zeroize.workspace = true

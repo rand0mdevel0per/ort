@@ -1,0 +1,23 @@
+[package]
+name = "ortd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ORT server daemon: terminates ORT tunnels and forwards plaintext to a fixed target"
+
+[[bin]]
+name = "ortd"
+path = "src/main.rs"
+
+[dependencies]
+ort-core.workspace = true
+ort-proto.workspace = true
+ort-net.workspace = true
+ort-cli.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+rcgen.workspace = true
