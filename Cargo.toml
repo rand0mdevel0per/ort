@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ort-core",
+    "crates/ort-proto",
+    "crates/ort-net",
+    "crates/ort-cli",
+    "crates/ortc",
+    "crates/ortd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/morgan156/ort"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# internal
+ort-core = { path = "crates/ort-core" }
+ort-proto = { path = "crates/ort-proto" }
+ort-net = { path = "crates/ort-net" }
+ort-cli = { path = "crates/ort-cli" }
+
+# crypto
+ml-kem = { version = "0.3", features = ["hazmat"] }
+ml-dsa = "0.1"
+aes-gcm = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"
+blake3 = "1"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.9"
+
+# wire / framing
+planus = "1"
+
+# certs
+rcgen = "0.14"
+rustls-webpki = "0.103"
+rustls-pki-types = "1"
+x509-parser = { version = "0.18", features = ["verify"] }
+
+# async / net
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+
+# cli / logging / errors
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
