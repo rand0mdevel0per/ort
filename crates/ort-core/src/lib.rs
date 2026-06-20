@@ -10,6 +10,7 @@ pub mod error;
 pub mod handshake;
 pub mod kdf;
 pub mod pool;
+pub mod prim;
 pub mod record;
 pub mod replay;
 pub mod suite;

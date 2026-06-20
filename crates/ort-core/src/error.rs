@@ -54,4 +54,16 @@ pub enum Error {
     /// A handshake message arrived in a state that does not expect it.
     #[error("unexpected handshake message in state {0}")]
     UnexpectedMessage(&'static str),
+
+    /// The OS random number generator failed.
+    #[error("OS RNG failure")]
+    RngFailure,
+
+    /// The server offered/accepted no cipher suite in common with the client.
+    #[error("no common cipher suite")]
+    NoCommonSuite,
+
+    /// The server accepted a suite the client did not offer.
+    #[error("server accepted an unoffered suite: {0:#06x}")]
+    UnexpectedSuiteSelection(u16),
 }

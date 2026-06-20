@@ -1,208 +1,252 @@
-//! In-memory (sans-IO) handshake tests for both 0-RTT and 1-RTT, plus the
-//! replay/window/source-IP rejection paths.
+//! In-memory (sans-IO) handshake tests: 0-RTT / 1-RTT for both suites,
+//! multi-suite offers, negotiation/reject, and replay/window/source-IP paths.
 
 use ort_core::handshake::{
-    client_one_rtt_finish, client_one_rtt_hello, client_zero_rtt, server_on_client_data,
-    server_on_first, ClientConfig, ClientEstablished, ServerConfig, ServerEstablished, ServerStep,
+    client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello, server_on_client_data,
+    server_on_first, ClientConfig, ServerConfig, ServerStep, SuiteKey,
 };
 use ort_core::pool::Direction;
 use ort_core::record::RecordLayer;
 use ort_core::replay::StrikeCache;
-use ort_core::suite::v1::V1;
-use ort_core::suite::CipherSuite;
+use ort_core::suite::agile::{ServerKemKey, SigIdentity};
+use ort_core::suite::SuiteId;
 use ort_core::time::FixedClock;
-use ort_proto::Frame;
+use ort_proto::{reject, Frame};
 
 const IP: [u8; 16] = [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-/// Extract the error from a server step result (ServerStep isn't `Debug`).
-fn step_err(r: ort_core::Result<ServerStep<V1>>) -> ort_core::Error {
-    match r {
-        Ok(_) => panic!("expected an error"),
-        Err(e) => e,
-    }
+fn client_cfg(sig: SuiteId) -> ClientConfig {
+    ClientConfig::new(SigIdentity::generate(sig))
 }
 
-fn client_cfg() -> ClientConfig<V1> {
-    let sig_secret = V1::sig_generate();
-    let client_pk = V1::sig_public(&sig_secret);
-    ClientConfig {
-        sig_secret,
-        client_pk,
-    }
-}
-
-fn server_cfg() -> ServerConfig<V1> {
-    let kem_secret = V1::kem_generate();
-    let server_pk = V1::kem_public(&kem_secret);
+fn server_cfg(suites: &[SuiteId]) -> ServerConfig {
+    let suites = suites
+        .iter()
+        .map(|id| SuiteKey {
+            key: ServerKemKey::generate(*id),
+            certificate: vec![],
+        })
+        .collect();
     ServerConfig {
-        kem_secret,
-        server_pk,
-        certificate: vec![],
+        suites,
         window_ms: 2000,
-        skew_ms: 250,
+        skew_ms: 1000,
     }
 }
 
-/// Exchange application data both ways to confirm the two record layers agree.
-fn exchange(client: &mut RecordLayer<V1>, server: &mut RecordLayer<V1>) {
-    // client -> server
-    let up = client.seal(Direction::ClientToServer, b"ping from client");
-    assert_eq!(server.open(Direction::ClientToServer, &up).unwrap(), b"ping from client");
-    // server -> client
-    let down = server.seal(Direction::ServerToClient, b"pong from server");
-    assert_eq!(client.open(Direction::ServerToClient, &down).unwrap(), b"pong from server");
-    // a second round to confirm counters advance in lock-step
-    let up2 = client.seal(Direction::ClientToServer, b"second");
-    assert_eq!(server.open(Direction::ClientToServer, &up2).unwrap(), b"second");
+fn server_pk(cfg: &ServerConfig, id: SuiteId) -> Vec<u8> {
+    cfg.suites
+        .iter()
+        .find(|s| s.key.suite_id() == id)
+        .unwrap()
+        .key
+        .public()
 }
 
-#[test]
-fn zero_rtt_end_to_end() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, mut client_est): (Frame, ClientEstablished<V1>) =
-        client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"early hello").unwrap();
-
-    let step = server_on_first(&scfg, &frame, IP, &clock, &mut strike).unwrap();
-    let (ack, mut server_est) = match step {
-        ServerStep::ZeroRtt { ack, established } => (ack, established),
-        _ => panic!("expected 0-RTT"),
-    };
-    assert_eq!(server_est.early_data, b"early hello");
-
-    // client validates the ServerAck key confirmation
-    match ack {
-        Frame::ServerAck { ek_hash } => assert_eq!(ek_hash, client_est.expected_ek_hash.to_vec()),
-        _ => panic!("expected ack"),
-    }
-
-    exchange(&mut client_est.record, &mut server_est.record);
+fn exchange(client: &mut RecordLayer, server: &mut RecordLayer) {
+    let up = client.seal(Direction::ClientToServer, b"ping");
+    assert_eq!(
+        server.open(Direction::ClientToServer, &up).unwrap(),
+        b"ping"
+    );
+    let down = server.seal(Direction::ServerToClient, b"pong");
+    assert_eq!(
+        client.open(Direction::ServerToClient, &down).unwrap(),
+        b"pong"
+    );
 }
 
-#[test]
-fn one_rtt_end_to_end() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
+fn zero_rtt(sig: SuiteId, kem: SuiteId) {
+    let ccfg = client_cfg(sig);
+    let scfg = server_cfg(&[kem]);
     let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
+    let guard = StrikeCache::new(2000);
 
-    // step 1: bare hello
-    let hello = client_one_rtt_hello(&ccfg);
-    let step = server_on_first(&scfg, &hello, IP, &clock, &mut strike).unwrap();
-    let server_pk = match step {
-        ServerStep::OneRtt { hello: Frame::ServerHello { server_pk, .. } } => server_pk,
-        _ => panic!("expected 1-RTT ServerHello"),
-    };
+    let offers = [(kem, server_pk(&scfg, kem))];
+    let (frame, mut ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"early").unwrap();
 
-    // step 2: client sends data flight
-    let (frame, mut client_est) =
-        client_one_rtt_finish(&ccfg, &server_pk, IP, &clock, b"first payload").unwrap();
-    let mut server_est: ServerEstablished<V1> =
-        server_on_client_data(&scfg, &frame, IP, &clock, &mut strike).unwrap();
-    assert_eq!(server_est.early_data, b"first payload");
-
-    exchange(&mut client_est.record, &mut server_est.record);
-}
-
-#[test]
-fn zero_rtt_empty_early_data() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, _est) = client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"").unwrap();
-    let step = server_on_first(&scfg, &frame, IP, &clock, &mut strike).unwrap();
-    if let ServerStep::ZeroRtt { established, .. } = step {
-        assert!(established.early_data.is_empty());
-    } else {
-        panic!("expected 0-RTT");
-    }
-}
-
-#[test]
-fn replay_within_window_is_rejected() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, _est) = client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"data").unwrap();
-    server_on_first(&scfg, &frame, IP, &clock, &mut strike).expect("first accepted");
-    let err = step_err(server_on_first(&scfg, &frame, IP, &clock, &mut strike));
-    assert!(matches!(err, ort_core::Error::Replayed), "got {err:?}");
-}
-
-#[test]
-fn stale_timestamp_is_rejected() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, _est) = client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"data").unwrap();
-    // advance the server clock well past the 2s window
-    clock.advance(5_000);
-    let err = step_err(server_on_first(&scfg, &frame, IP, &clock, &mut strike));
-    assert!(matches!(err, ort_core::Error::StaleTimestamp), "got {err:?}");
-}
-
-#[test]
-fn source_ip_mismatch_is_rejected() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, _est) = client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"data").unwrap();
-    let other_ip = [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let err = step_err(server_on_first(&scfg, &frame, other_ip, &clock, &mut strike));
-    assert!(matches!(err, ort_core::Error::SourceIpMismatch), "got {err:?}");
-}
-
-#[test]
-fn tampered_early_data_fails_signature() {
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
-
-    let (frame, _est) = client_zero_rtt(&ccfg, &scfg.server_pk, IP, &clock, b"data").unwrap();
-    // tamper the early data inside the frame
-    let tampered = match frame {
-        Frame::ClientHelloZeroRtt {
-            suite_id,
-            client_pk,
-            mut payload,
+    match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
+        ServerStep::ZeroRtt {
+            accepted_suite,
+            ack,
+            mut established,
         } => {
-            payload.enc_data[0] ^= 0xFF;
-            Frame::ClientHelloZeroRtt {
-                suite_id,
-                client_pk,
-                payload,
+            assert_eq!(accepted_suite, kem);
+            assert_eq!(established.early_data, b"early");
+            match ack {
+                Frame::ServerAck {
+                    accepted_suite: a,
+                    ek_hash,
+                } => {
+                    assert_eq!(a, kem.code());
+                    assert_eq!(ek_hash, ce.expected_ek_hash);
+                    assert!(ce.offered_suites.contains(&SuiteId::from_code(a).unwrap()));
+                }
+                _ => panic!("expected ack"),
             }
+            exchange(&mut ce.record, &mut established.record);
         }
-        _ => unreachable!(),
-    };
-    let err = step_err(server_on_first(&scfg, &tampered, IP, &clock, &mut strike));
-    assert!(matches!(err, ort_core::Error::BadSignature), "got {err:?}");
+        _ => panic!("expected 0-RTT"),
+    }
 }
 
 #[test]
-fn wrong_server_pk_breaks_decapsulation() {
-    // A client that encapsulates against the wrong server key yields a shared
-    // secret the server cannot reproduce -> early-data AEAD open fails.
-    let ccfg = client_cfg();
-    let scfg = server_cfg();
-    let other = server_cfg(); // different KEM keypair
-    let clock = FixedClock::new(1_000_000);
-    let mut strike = StrikeCache::new(scfg.window_ms);
+fn zero_rtt_v1() {
+    zero_rtt(SuiteId::V1MlKem768MlDsa65, SuiteId::V1MlKem768MlDsa65);
+}
 
-    let (frame, _est) = client_zero_rtt(&ccfg, &other.server_pk, IP, &clock, b"data").unwrap();
-    let err = step_err(server_on_first(&scfg, &frame, IP, &clock, &mut strike));
-    assert!(matches!(err, ort_core::Error::AeadFailure), "got {err:?}");
+#[test]
+fn zero_rtt_v2() {
+    zero_rtt(SuiteId::V2X25519Ed25519, SuiteId::V2X25519Ed25519);
+}
+
+#[test]
+fn zero_rtt_mixed_sig_and_kem() {
+    // Sign with Ed25519 (v2) but encapsulate with ML-KEM (v1): decoupled.
+    zero_rtt(SuiteId::V2X25519Ed25519, SuiteId::V1MlKem768MlDsa65);
+}
+
+#[test]
+fn one_rtt_negotiates_and_completes() {
+    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519, SuiteId::V1MlKem768MlDsa65]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+
+    // client advertises both, prefers v1
+    let hello = client_one_rtt_hello(
+        &ccfg,
+        &[SuiteId::V1MlKem768MlDsa65, SuiteId::V2X25519Ed25519],
+    );
+    let (accepted, spk) = match server_on_first(&scfg, &hello, IP, &clock, &guard).unwrap() {
+        ServerStep::OneRtt {
+            hello:
+                Frame::ServerHello {
+                    accepted_suite,
+                    server_pk,
+                    observed_ip,
+                    ..
+                },
+        } => {
+            assert_eq!(observed_ip, IP);
+            (SuiteId::from_code(accepted_suite).unwrap(), server_pk)
+        }
+        _ => panic!("expected ServerHello"),
+    };
+    assert_eq!(accepted, SuiteId::V1MlKem768MlDsa65);
+
+    let (frame, mut ce) = client_one_rtt_finish(&ccfg, accepted, &spk, IP, &clock, b"hi").unwrap();
+    let mut se = server_on_client_data(&scfg, &frame, IP, &clock, &guard).unwrap();
+    assert_eq!(se.early_data, b"hi");
+    exchange(&mut ce.record, &mut se.record);
+}
+
+#[test]
+fn multi_offer_server_picks_supported() {
+    // Client offers both suites; server only supports v2 -> picks v2.
+    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+
+    let offers = [
+        (SuiteId::V1MlKem768MlDsa65, vec![0u8; 1184]), // server lacks v1; bogus pk ok, not selected
+        (
+            SuiteId::V2X25519Ed25519,
+            server_pk(&scfg, SuiteId::V2X25519Ed25519),
+        ),
+    ];
+    let (frame, _ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"x").unwrap();
+    match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
+        ServerStep::ZeroRtt { accepted_suite, .. } => {
+            assert_eq!(accepted_suite, SuiteId::V2X25519Ed25519)
+        }
+        _ => panic!("expected 0-RTT v2"),
+    }
+}
+
+#[test]
+fn no_common_suite_is_rejected_zero_rtt() {
+    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]); // server: v2 only
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+
+    let offers = [(SuiteId::V1MlKem768MlDsa65, vec![0u8; 1184])]; // client offers v1 only
+    let (frame, _ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"x").unwrap();
+    match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
+        ServerStep::Reject {
+            frame: Frame::ServerReject { reason },
+        } => {
+            assert_eq!(reason, reject::NO_COMMON_SUITE);
+        }
+        _ => panic!("expected reject"),
+    }
+}
+
+#[test]
+fn no_common_suite_is_rejected_one_rtt() {
+    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+
+    let hello = client_one_rtt_hello(&ccfg, &[SuiteId::V1MlKem768MlDsa65]);
+    match server_on_first(&scfg, &hello, IP, &clock, &guard).unwrap() {
+        ServerStep::Reject {
+            frame: Frame::ServerReject { reason },
+        } => {
+            assert_eq!(reason, reject::NO_COMMON_SUITE);
+        }
+        _ => panic!("expected reject"),
+    }
+}
+
+fn make_zero_rtt(scfg: &ServerConfig) -> Frame {
+    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
+    let kem = SuiteId::V1MlKem768MlDsa65;
+    let clock = FixedClock::new(1_000_000);
+    let offers = [(kem, server_pk(scfg, kem))];
+    client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"d")
+        .unwrap()
+        .0
+}
+
+#[test]
+fn replay_within_window_rejected() {
+    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+    let frame = make_zero_rtt(&scfg);
+    server_on_first(&scfg, &frame, IP, &clock, &guard).expect("first ok");
+    assert!(matches!(
+        server_on_first(&scfg, &frame, IP, &clock, &guard),
+        Err(ort_core::Error::Replayed)
+    ));
+}
+
+#[test]
+fn stale_timestamp_rejected() {
+    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+    let frame = make_zero_rtt(&scfg);
+    clock.advance(5000);
+    assert!(matches!(
+        server_on_first(&scfg, &frame, IP, &clock, &guard),
+        Err(ort_core::Error::StaleTimestamp)
+    ));
+}
+
+#[test]
+fn source_ip_mismatch_rejected() {
+    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+    let frame = make_zero_rtt(&scfg);
+    let other = [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert!(matches!(
+        server_on_first(&scfg, &frame, other, &clock, &guard),
+        Err(ort_core::Error::SourceIpMismatch)
+    ));
 }

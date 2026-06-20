@@ -9,13 +9,29 @@ use clap::Parser;
 
 use ort_cli::{hex, init_tracing, read_key, write_key};
 use ort_core::handshake::ClientConfig;
-use ort_core::suite::v1::V1;
-use ort_core::suite::CipherSuite;
-use ort_net::{run_client, ServerVerifier};
+use ort_core::suite::agile::SigIdentity;
+use ort_core::suite::SuiteId;
+use ort_net::{run_client, ClientParams, ServerVerifier};
 use tokio::net::TcpListener;
 
+fn parse_suite(s: &str) -> Result<SuiteId> {
+    match s {
+        "v1" => Ok(SuiteId::V1MlKem768MlDsa65),
+        "v2" => Ok(SuiteId::V2X25519Ed25519),
+        other => anyhow::bail!("unknown suite '{other}' (expected v1 or v2)"),
+    }
+}
+
+fn parse_suites(s: &str) -> Result<Vec<SuiteId>> {
+    s.split(',').map(|p| parse_suite(p.trim())).collect()
+}
+
 #[derive(Parser)]
-#[command(name = "ortc", version, about = "ORT client: tunnel local TCP to an ortd")]
+#[command(
+    name = "ortc",
+    version,
+    about = "ORT client: tunnel local TCP to an ortd"
+)]
 struct Cli {
     /// Local address to listen on for application connections.
     #[arg(long)]
@@ -26,38 +42,40 @@ struct Cli {
     /// Skip strict certificate validation; trust the server key on first use.
     #[arg(long)]
     no_strict_cert: bool,
-    /// Client signing key file (ML-DSA seed). Generated if the path is absent.
-    #[arg(long)]
-    client_key: Option<PathBuf>,
-    /// DER CA certificate to anchor strict verification to. If omitted in
-    /// strict mode, the server certificate must be validly self-signed.
+    /// DER CA certificate to anchor strict verification to (else self-signed).
     #[arg(long)]
     ca: Option<PathBuf>,
+    /// Signature algorithm for the client identity: `v1` (ML-DSA) or `v2` (Ed25519).
+    #[arg(long, default_value = "v1")]
+    sig_alg: String,
+    /// KEM suites to offer, in preference order (e.g. `v1,v2`).
+    #[arg(long, default_value = "v1,v2")]
+    suites: String,
+    /// Client signing key file (seed). Generated if the path is absent.
+    #[arg(long)]
+    client_key: Option<PathBuf>,
     /// Always use 1-RTT (disable 0-RTT resumption).
     #[arg(long)]
     force_1rtt: bool,
 }
 
-fn load_client_config(args: &Cli) -> Result<ClientConfig<V1>> {
-    let sig_secret = match &args.client_key {
+fn load_identity(args: &Cli, sig_alg: SuiteId) -> Result<SigIdentity> {
+    match &args.client_key {
         Some(path) if path.exists() => {
             let seed = read_key(path)?;
-            V1::sig_secret_from_bytes(&seed).context("decode client signing key")?
+            SigIdentity::from_seed(sig_alg, &seed).context("decode client signing key")
         }
         Some(path) => {
-            let s = V1::sig_generate();
-            write_key(path, &V1::sig_secret_to_bytes(&s))?;
+            let id = SigIdentity::generate(sig_alg);
+            write_key(path, &id.to_seed())?;
             tracing::info!(path = %path.display(), "generated new client signing key");
-            s
+            Ok(id)
         }
         None => {
             tracing::info!("using an ephemeral client signing key for this run");
-            V1::sig_generate()
+            Ok(SigIdentity::generate(sig_alg))
         }
-    };
-    let client_pk = V1::sig_public(&sig_secret);
-    tracing::info!(client_pk = %hex(&client_pk), "client public key");
-    Ok(ClientConfig { sig_secret, client_pk })
+    }
 }
 
 #[tokio::main]
@@ -77,12 +95,23 @@ async fn main() -> Result<()> {
         ServerVerifier::Strict { ca }
     };
 
-    let ccfg = Arc::new(load_client_config(&args)?);
+    let sig_alg = parse_suite(&args.sig_alg)?;
+    let kem_suites = parse_suites(&args.suites)?;
+    let identity = load_identity(&args, sig_alg)?;
+    let cfg = ClientConfig::new(identity);
+    tracing::info!(client_pk = %hex(&cfg.client_pk), sig_alg = %args.sig_alg, "client identity");
+
+    let params = Arc::new(ClientParams {
+        cfg,
+        kem_suites,
+        verifier,
+        force_1rtt: args.force_1rtt,
+    });
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
     tracing::info!(listen = %args.listen, target = %args.target, "ortc listening");
 
-    run_client(listener, args.target, ccfg, verifier, args.force_1rtt).await?;
+    run_client(listener, args.target, params).await?;
     Ok(())
 }

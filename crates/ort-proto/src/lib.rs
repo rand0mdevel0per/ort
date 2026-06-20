@@ -9,7 +9,7 @@ pub mod frame;
 pub mod messages;
 
 pub use frame::{encode_framed, parse_len, MAX_FRAME};
-pub use messages::{Frame, FrameType, KemPayload};
+pub use messages::{reject, Frame, FrameType, KemPayload, SuiteOffer, EK_HASH_LEN, MAX_SUITES};
 
 use thiserror::Error;
 
@@ -28,4 +28,13 @@ pub enum ProtoError {
     /// Frame length prefix exceeds [`MAX_FRAME`].
     #[error("frame too large: {0} bytes")]
     FrameTooLarge(usize),
+    /// A field held a value outside its permitted set.
+    #[error("invalid value for {0}")]
+    InvalidValue(&'static str),
+    /// A repeated field exceeded its maximum count.
+    #[error("too many {0}")]
+    TooMany(&'static str),
+    /// A required repeated field was empty.
+    #[error("empty {0}")]
+    Empty(&'static str),
 }

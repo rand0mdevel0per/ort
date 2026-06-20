@@ -4,8 +4,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum SuiteId {
-    /// ML-KEM-768 + ML-DSA-65 + AES-256-GCM + HKDF-SHA256 + BLAKE3-512.
+    /// Post-quantum: ML-KEM-768 + ML-DSA-65 + AES-256-GCM + HKDF-SHA256 + BLAKE3.
     V1MlKem768MlDsa65 = 0x0001,
+    /// Classical (audited primitives): DHKEM(X25519) + Ed25519 + AES-256-GCM +
+    /// HKDF-SHA256 + BLAKE3.
+    V2X25519Ed25519 = 0x0002,
 }
 
 impl SuiteId {
@@ -18,6 +21,7 @@ impl SuiteId {
     pub fn from_code(code: u16) -> Option<Self> {
         match code {
             0x0001 => Some(SuiteId::V1MlKem768MlDsa65),
+            0x0002 => Some(SuiteId::V2X25519Ed25519),
             _ => None,
         }
     }

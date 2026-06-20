@@ -3,24 +3,41 @@
 use crate::codec::{Reader, Writer};
 use crate::ProtoError;
 
+/// Maximum number of cipher suites a client may advertise/offer in one hello
+/// (bounds allocation when decoding).
+pub const MAX_SUITES: usize = 16;
+
+/// BLAKE3-512 key-confirmation hash length.
+pub const EK_HASH_LEN: usize = 64;
+
+/// Reason codes for [`Frame::ServerReject`].
+pub mod reject {
+    /// No cipher suite offered by the client is supported by the server.
+    pub const NO_COMMON_SUITE: u8 = 1;
+    /// The handshake failed validation (signature/replay/decrypt).
+    pub const BAD_HANDSHAKE: u8 = 2;
+}
+
 /// Frame type tags (first byte of every frame body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
-    /// First flight, 1-RTT mode: just requests the server cert + public key.
+    /// First flight, 1-RTT mode: advertise supported suites, request cert + key.
     ClientHelloOneRtt = 0x01,
-    /// First flight, 0-RTT mode: full KEM payload + early data.
+    /// First flight, 0-RTT mode: multi-suite offers + early data.
     ClientHelloZeroRtt = 0x02,
-    /// Second flight in 1-RTT mode: the KEM payload + first data.
+    /// Second flight in 1-RTT mode: offers (for the negotiated suite) + data.
     ClientData = 0x03,
-    /// Server response carrying its public key + certificate.
+    /// Server response carrying the accepted suite, its public key + cert.
     ServerHello = 0x04,
-    /// Server 0-RTT acknowledgement carrying the key-confirmation hash.
+    /// Server 0-RTT acknowledgement: accepted suite + key-confirmation hash.
     ServerAck = 0x05,
+    /// Server refusal (e.g. no common suite, bad handshake).
+    ServerReject = 0x06,
     /// An AEAD-protected application data record.
-    DataRecord = 0x06,
+    DataRecord = 0x07,
     /// Orderly shutdown.
-    Close = 0x07,
+    Close = 0x08,
 }
 
 impl FrameType {
@@ -31,51 +48,85 @@ impl FrameType {
             0x03 => FrameType::ClientData,
             0x04 => FrameType::ServerHello,
             0x05 => FrameType::ServerAck,
-            0x06 => FrameType::DataRecord,
-            0x07 => FrameType::Close,
+            0x06 => FrameType::ServerReject,
+            0x07 => FrameType::DataRecord,
+            0x08 => FrameType::Close,
             other => return Err(ProtoError::UnknownFrameType(other)),
         })
     }
 }
 
-/// The KEM-bearing payload sent by the client (in 0-RTT ClientHello or the
-/// 1-RTT second flight). Carries everything the server needs to derive keys,
-/// authenticate the handshake and decrypt the first data block.
+/// One per-suite offer: a KEM encapsulation against that suite's server key,
+/// plus the session key (`enc_sk`) wrapped under the resulting shared secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteOffer {
+    /// Cipher-suite id this offer is for.
+    pub suite_id: u16,
+    /// KEM ciphertext (encapsulation against the suite's server public key).
+    pub ciphertext: Vec<u8>,
+    /// `enc_sk` sealed under a key derived from this offer's shared secret.
+    pub wrapped_enc_sk: Vec<u8>,
+}
+
+/// The client's KEM-bearing payload (0-RTT ClientHello or 1-RTT ClientData).
+///
+/// A single random session key `enc_sk` encrypts `enc_data`; each offer wraps a
+/// copy of `enc_sk` for one suite, so the server can adopt whichever offered
+/// suite it supports without an extra round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KemPayload {
-    /// ML-KEM ciphertext (encapsulation against the server public key).
-    pub ciphertext: Vec<u8>,
-    /// Client source IP (16 bytes, IPv6 or IPv4-mapped).
+    /// One or more per-suite offers (at least one).
+    pub offers: Vec<SuiteOffer>,
+    /// Client source IP (16 bytes; for 1-RTT this echoes the server-observed IP).
     pub src_ip: [u8; 16],
     /// Client timestamp in milliseconds since the Unix epoch.
     pub ts_millis: u64,
     /// Fresh per-connection nonce.
     pub nonce: [u8; 32],
-    /// ML-DSA signature over the client binding string.
+    /// ML-DSA/Ed25519 signature over the client binding string.
     pub client_sig: Vec<u8>,
-    /// AEAD-sealed early data (`ciphertext || tag`). The nonce is derived from
-    /// the entropy pool (counter 0, c→s) on both peers, so it is not transmitted.
+    /// AEAD-sealed early data under `enc_sk`. The record nonce is pool-derived.
     pub enc_data: Vec<u8>,
 }
 
 impl KemPayload {
     fn write(&self, w: &mut Writer) {
-        w.bytes16(&self.ciphertext)
-            .raw(&self.src_ip)
+        w.u16(self.offers.len() as u16);
+        for o in &self.offers {
+            w.u16(o.suite_id)
+                .bytes(&o.ciphertext)
+                .bytes(&o.wrapped_enc_sk);
+        }
+        w.raw(&self.src_ip)
             .u64(self.ts_millis)
             .raw(&self.nonce)
-            .bytes16(&self.client_sig)
-            .bytes32(&self.enc_data);
+            .bytes(&self.client_sig)
+            .bytes(&self.enc_data);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, ProtoError> {
+        let count = r.u16()? as usize;
+        if count == 0 {
+            return Err(ProtoError::Empty("suite offers"));
+        }
+        if count > MAX_SUITES {
+            return Err(ProtoError::TooMany("suite offers"));
+        }
+        let mut offers = Vec::with_capacity(count);
+        for _ in 0..count {
+            offers.push(SuiteOffer {
+                suite_id: r.u16()?,
+                ciphertext: r.bytes()?.to_vec(),
+                wrapped_enc_sk: r.bytes()?.to_vec(),
+            });
+        }
         Ok(KemPayload {
-            ciphertext: r.bytes16()?.to_vec(),
+            offers,
             src_ip: r.array::<16>()?,
             ts_millis: r.u64()?,
             nonce: r.array::<32>()?,
-            client_sig: r.bytes16()?.to_vec(),
-            enc_data: r.bytes32()?.to_vec(),
+            client_sig: r.bytes()?.to_vec(),
+            enc_data: r.bytes()?.to_vec(),
         })
     }
 }
@@ -83,49 +134,62 @@ impl KemPayload {
 /// A decoded ORT protocol frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// 1-RTT ClientHello: negotiate suite, present client verifying key.
+    /// 1-RTT ClientHello: advertise suites + present client verifying key.
     ClientHelloOneRtt {
-        /// Negotiated cipher-suite id.
-        suite_id: u16,
-        /// Client ML-DSA verifying key.
+        /// Client verifying key.
         client_pk: Vec<u8>,
+        /// Signature algorithm (suite id) that `client_pk`/signatures use.
+        sig_alg: u16,
+        /// KEM suite ids the client supports, in preference order.
+        available_suites: Vec<u16>,
     },
-    /// 0-RTT ClientHello: suite + client key + full KEM payload.
+    /// 0-RTT ClientHello: client key + multi-suite KEM payload.
     ClientHelloZeroRtt {
-        /// Negotiated cipher-suite id.
-        suite_id: u16,
-        /// Client ML-DSA verifying key.
+        /// Client verifying key.
         client_pk: Vec<u8>,
-        /// KEM payload and early data.
+        /// Signature algorithm (suite id) for `client_pk`/`client_sig`.
+        sig_alg: u16,
+        /// Multi-suite offers + early data.
         payload: KemPayload,
     },
-    /// 1-RTT second flight: KEM payload + first data.
+    /// 1-RTT second flight: KEM payload (for the negotiated suite) + first data.
     ClientData {
-        /// Client ML-DSA verifying key (repeated so the frame is self-contained).
+        /// Client verifying key (repeated so the frame is self-contained).
         client_pk: Vec<u8>,
-        /// KEM payload and first data.
+        /// Signature algorithm (suite id) for `client_pk`/`client_sig`.
+        sig_alg: u16,
+        /// KEM payload + first data.
         payload: KemPayload,
     },
-    /// Server hello carrying the KEM public key and (optional) certificate.
+    /// Server hello carrying the accepted suite, KEM public key and cert.
     ServerHello {
-        /// Negotiated cipher-suite id.
-        suite_id: u16,
-        /// ML-KEM encapsulation (public) key.
+        /// The cipher suite the server selected.
+        accepted_suite: u16,
+        /// KEM encapsulation (public) key for the accepted suite.
         server_pk: Vec<u8>,
         /// DER certificate chain binding `server_pk` (empty if none).
         certificate: Vec<u8>,
+        /// The client source IP as observed by the server (NAT-safe ConnMeta).
+        observed_ip: [u8; 16],
         /// Server timestamp in milliseconds.
         server_ts: u64,
     },
-    /// 0-RTT acknowledgement: BLAKE3-512 of the derived enc key.
+    /// 0-RTT acknowledgement: accepted suite + BLAKE3-512 of the derived key.
     ServerAck {
-        /// Key-confirmation hash.
-        ek_hash: Vec<u8>,
+        /// The cipher suite the server adopted from the offers.
+        accepted_suite: u16,
+        /// Key-confirmation hash (`EK_HASH_LEN` bytes).
+        ek_hash: [u8; EK_HASH_LEN],
+    },
+    /// Server refusal with a reason code (see [`reject`]).
+    ServerReject {
+        /// Reason code.
+        reason: u8,
     },
     /// Application data record.
     DataRecord {
-        /// Direction tag (0 = c→s, 1 = s→c).
-        dir: u8,
+        /// `true` if sent by the server (s→c), `false` if by the client (c→s).
+        from_server: bool,
         /// AEAD-sealed record (`ciphertext || tag`).
         ciphertext: Vec<u8>,
     },
@@ -134,47 +198,76 @@ pub enum Frame {
 }
 
 impl Frame {
-    /// Encode this frame's body (type tag + fields) — without the outer length
+    /// Encode this frame's body (type tag + fields) without the outer length
     /// prefix (see [`crate::frame`]).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(64);
         match self {
-            Frame::ClientHelloOneRtt { suite_id, client_pk } => {
+            Frame::ClientHelloOneRtt {
+                client_pk,
+                sig_alg,
+                available_suites,
+            } => {
                 w.u8(FrameType::ClientHelloOneRtt as u8)
-                    .u16(*suite_id)
-                    .bytes16(client_pk);
+                    .bytes(client_pk)
+                    .u16(*sig_alg);
+                w.u16(available_suites.len() as u16);
+                for s in available_suites {
+                    w.u16(*s);
+                }
             }
             Frame::ClientHelloZeroRtt {
-                suite_id,
                 client_pk,
+                sig_alg,
                 payload,
             } => {
                 w.u8(FrameType::ClientHelloZeroRtt as u8)
-                    .u16(*suite_id)
-                    .bytes16(client_pk);
+                    .bytes(client_pk)
+                    .u16(*sig_alg);
                 payload.write(&mut w);
             }
-            Frame::ClientData { client_pk, payload } => {
-                w.u8(FrameType::ClientData as u8).bytes16(client_pk);
+            Frame::ClientData {
+                client_pk,
+                sig_alg,
+                payload,
+            } => {
+                w.u8(FrameType::ClientData as u8)
+                    .bytes(client_pk)
+                    .u16(*sig_alg);
                 payload.write(&mut w);
             }
             Frame::ServerHello {
-                suite_id,
+                accepted_suite,
                 server_pk,
                 certificate,
+                observed_ip,
                 server_ts,
             } => {
                 w.u8(FrameType::ServerHello as u8)
-                    .u16(*suite_id)
-                    .bytes16(server_pk)
-                    .bytes32(certificate)
+                    .u16(*accepted_suite)
+                    .bytes(server_pk)
+                    .bytes(certificate)
+                    .raw(observed_ip)
                     .u64(*server_ts);
             }
-            Frame::ServerAck { ek_hash } => {
-                w.u8(FrameType::ServerAck as u8).bytes16(ek_hash);
+            Frame::ServerAck {
+                accepted_suite,
+                ek_hash,
+            } => {
+                w.u8(FrameType::ServerAck as u8)
+                    .u16(*accepted_suite)
+                    .raw(ek_hash);
             }
-            Frame::DataRecord { dir, ciphertext } => {
-                w.u8(FrameType::DataRecord as u8).u8(*dir).bytes32(ciphertext);
+            Frame::ServerReject { reason } => {
+                w.u8(FrameType::ServerReject as u8).u8(*reason);
+            }
+            Frame::DataRecord {
+                from_server,
+                ciphertext,
+            } => {
+                w.u8(FrameType::DataRecord as u8)
+                    .u8(u8::from(*from_server))
+                    .bytes(ciphertext);
             }
             Frame::Close => {
                 w.u8(FrameType::Close as u8);
@@ -188,32 +281,59 @@ impl Frame {
         let mut r = Reader::new(buf);
         let ty = FrameType::from_u8(r.u8()?)?;
         let frame = match ty {
-            FrameType::ClientHelloOneRtt => Frame::ClientHelloOneRtt {
-                suite_id: r.u16()?,
-                client_pk: r.bytes16()?.to_vec(),
-            },
+            FrameType::ClientHelloOneRtt => {
+                let client_pk = r.bytes()?.to_vec();
+                let sig_alg = r.u16()?;
+                let count = r.u16()? as usize;
+                if count == 0 {
+                    return Err(ProtoError::Empty("available suites"));
+                }
+                if count > MAX_SUITES {
+                    return Err(ProtoError::TooMany("available suites"));
+                }
+                let mut available_suites = Vec::with_capacity(count);
+                for _ in 0..count {
+                    available_suites.push(r.u16()?);
+                }
+                Frame::ClientHelloOneRtt {
+                    client_pk,
+                    sig_alg,
+                    available_suites,
+                }
+            }
             FrameType::ClientHelloZeroRtt => Frame::ClientHelloZeroRtt {
-                suite_id: r.u16()?,
-                client_pk: r.bytes16()?.to_vec(),
+                client_pk: r.bytes()?.to_vec(),
+                sig_alg: r.u16()?,
                 payload: KemPayload::read(&mut r)?,
             },
             FrameType::ClientData => Frame::ClientData {
-                client_pk: r.bytes16()?.to_vec(),
+                client_pk: r.bytes()?.to_vec(),
+                sig_alg: r.u16()?,
                 payload: KemPayload::read(&mut r)?,
             },
             FrameType::ServerHello => Frame::ServerHello {
-                suite_id: r.u16()?,
-                server_pk: r.bytes16()?.to_vec(),
-                certificate: r.bytes32()?.to_vec(),
+                accepted_suite: r.u16()?,
+                server_pk: r.bytes()?.to_vec(),
+                certificate: r.bytes()?.to_vec(),
+                observed_ip: r.array::<16>()?,
                 server_ts: r.u64()?,
             },
             FrameType::ServerAck => Frame::ServerAck {
-                ek_hash: r.bytes16()?.to_vec(),
+                accepted_suite: r.u16()?,
+                ek_hash: r.array::<EK_HASH_LEN>()?,
             },
-            FrameType::DataRecord => Frame::DataRecord {
-                dir: r.u8()?,
-                ciphertext: r.bytes32()?.to_vec(),
-            },
+            FrameType::ServerReject => Frame::ServerReject { reason: r.u8()? },
+            FrameType::DataRecord => {
+                let from_server = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ProtoError::InvalidValue("data record direction")),
+                };
+                Frame::DataRecord {
+                    from_server,
+                    ciphertext: r.bytes()?.to_vec(),
+                }
+            }
             FrameType::Close => Frame::Close,
         };
         r.expect_end()?;

@@ -54,7 +54,9 @@ impl ServerVerifier {
             .map_err(|e| OrtError::Cert(format!("parse certificate: {e}")))?;
 
         if !cert.validity().is_valid() {
-            return Err(OrtError::Cert("certificate expired or not yet valid".into()));
+            return Err(OrtError::Cert(
+                "certificate expired or not yet valid".into(),
+            ));
         }
 
         match ca {

@@ -6,7 +6,10 @@ use ort_proto::{parse_len, Frame};
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn byte(&mut self) -> u8 {
@@ -30,8 +33,16 @@ fn structured_but_corrupt_frames_never_panic() {
     // Start from valid frame bodies, then corrupt each prefix length.
     let valids = [
         Frame::Close.encode(),
-        Frame::ServerAck { ek_hash: vec![0u8; 64] }.encode(),
-        Frame::DataRecord { dir: 0, ciphertext: vec![1u8; 100] }.encode(),
+        Frame::ServerAck {
+            accepted_suite: 1,
+            ek_hash: [0u8; 64],
+        }
+        .encode(),
+        Frame::DataRecord {
+            from_server: false,
+            ciphertext: vec![1u8; 100],
+        }
+        .encode(),
     ];
     let mut rng = Lcg(42);
     for base in &valids {

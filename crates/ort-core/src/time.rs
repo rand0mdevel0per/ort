@@ -30,7 +30,9 @@ pub struct FixedClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
 impl FixedClock {
     /// Create a clock pinned at `millis`.
     pub fn new(millis: u64) -> Self {
-        FixedClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(millis)))
+        FixedClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            millis,
+        )))
     }
     /// Set the current time.
     pub fn set(&self, millis: u64) {
