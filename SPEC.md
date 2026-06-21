@@ -4,7 +4,7 @@ ORT is a transparent TCP-forwarding tunnel with a custom, cipher-suite-agile
 post-quantum handshake. It cares nothing about the upper-layer protocol — any
 TCP byte stream tunnels through unchanged.
 
-```
+```text
 app ──tcp──▶ ortc ──[ORT over TCP]──▶ ortd ──tcp──▶ target
 ```
 
@@ -30,7 +30,7 @@ session key `enc_sk` (the DEK), encrypts the early data once under it, and for
 each offered suite encapsulates against that suite's server public key and wraps
 a copy of `enc_sk`:
 
-```
+```text
 enc_sk      = random 32 bytes (per connection)
 (ct_i, k_i) = Suite_i.encapsulate(server_pk_i, r_i)        # r_i fresh per offer
 wrap_key_i  = HKDF(k_i, salt=BLAKE3-256(ct_i), "ORT-v1 wrap-key")
@@ -45,7 +45,7 @@ keys are unique — no cross-session `(key, nonce)` reuse.
 
 ### Record keys & nonces
 
-```
+```text
 ENC_KEY  = HKDF(enc_sk, salt=ConnMeta.nonce, "ORT-v1 enc-key")
 POOL_KEY = HKDF(enc_sk, salt=ConnMeta.nonce, "ORT-v1 pool-key")
 ```
@@ -62,7 +62,7 @@ halves so the two directions run lock-free in separate tasks (full duplex).
 Each client flight carries `ConnMeta = {src_ip(16), ts_millis, nonce(32)}` and
 one signature over:
 
-```
+```text
 "ORT-v1 connmeta" || version || sig_alg || src_ip || ts || nonce
                   || client_pk || H(offers) || H(enc_data)
 ```
