@@ -97,6 +97,8 @@ pub struct KemPayload {
 
 impl KemPayload {
     fn write(&self, w: &mut Writer) {
+        // Note: encoder does not validate bounds; the decoder will reject invalid payloads.
+        // This allows robustness tests to encode malformed frames for testing purposes.
         w.u16(self.offers.len() as u16);
         for o in &self.offers {
             w.u16(o.suite_id)
@@ -225,6 +227,7 @@ impl Frame {
                 w.u8(FrameType::ClientHelloOneRtt as u8)
                     .bytes(client_pk)
                     .u16(*sig_alg);
+                // Note: encoder does not validate bounds; decoder will reject invalid payloads.
                 w.u16(available_suites.len() as u16);
                 for s in available_suites {
                     w.u16(*s);

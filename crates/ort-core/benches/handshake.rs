@@ -86,15 +86,16 @@ fn bench_half_rtt(c: &mut Criterion) {
         let clock = FixedClock::new(1_000_000);
         let guard = StrikeCache::new(2000);
 
-        // Pre-populate guard to trigger Half-RTT
+        // Pre-create frame outside the benchmark loop so replay triggers Half-RTT
         let (frame, _) = client_offer_zero_rtt(&ccfg, suite, &spk, IP, &clock, b"x").unwrap();
+        // First one is accepted as 0-RTT, marking it in the guard
         server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap();
 
         group.bench_function(BenchmarkId::new("Half-RTT", suite_name), |b| {
             b.iter(|| {
-                // Replay triggers Half-RTT fallback
-                let (frame, mut est) =
-                    client_offer_zero_rtt(&ccfg, suite, &spk, IP, &clock, b"x").unwrap();
+                // Reuse same frame -> replay triggers Half-RTT fallback
+                // Create fresh client state for finish (can't clone RecordLayer)
+                let (_, mut est) = client_offer_zero_rtt(&ccfg, suite, &spk, IP, &clock, b"y").unwrap();
                 let step = server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap();
                 if let ServerStep::HalfRtt { frame, .. } = step {
                     if let Frame::ServerRefuse0RTT {
