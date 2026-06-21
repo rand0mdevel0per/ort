@@ -63,10 +63,8 @@ pub struct Learned {
 
 /// Result of a client handshake.
 pub struct ClientOutcome {
-    /// Established connection.
+    /// Established connection (handshake fully complete, incl. 0-RTT ServerAck).
     pub conn: OrtConn,
-    /// 0-RTT only: `(expected ek_hash, offered suites)` for ServerAck checking.
-    pub expect_ack: Option<([u8; 64], Vec<SuiteId>)>,
     /// 1-RTT only: server key info to cache for future 0-RTT.
     pub learned: Option<Learned>,
 }
@@ -128,7 +126,6 @@ pub async fn client_1rtt<C: Clock>(
             record: est.record,
             role: Role::Client,
         },
-        expect_ack: None,
         learned: Some(Learned {
             observed_ip,
             accepted_suite: suite,
@@ -137,19 +134,39 @@ pub async fn client_1rtt<C: Clock>(
     })
 }
 
-/// Drive the client's 0-RTT handshake using cached `offers` and the previously
-/// server-observed `src_ip`.
+/// Drive the client's 0-RTT handshake resuming a single cached `suite` (with
+/// its `server_pk`) and the previously server-observed `src_ip`. The ServerAck
+/// is read and verified inline, so the returned connection is fully confirmed;
+/// a `ServerReject` (e.g. the server dropped the suite) surfaces as
+/// [`OrtError::Rejected`] so the caller can fall back to 1-RTT.
 pub async fn client_0rtt<C: Clock>(
     stream: TcpStream,
     cfg: &ClientConfig,
-    offers: &[(SuiteId, Vec<u8>)],
+    suite: SuiteId,
+    server_pk: &[u8],
     src_ip: [u8; 16],
     clock: &C,
     early_data: &[u8],
 ) -> Result<ClientOutcome> {
-    let (reader, mut writer) = split(stream);
-    let (frame, est) = client_offer_zero_rtt(cfg, offers, src_ip, clock, early_data)?;
+    let (mut reader, mut writer) = split(stream);
+    let (frame, est) = client_offer_zero_rtt(cfg, suite, server_pk, src_ip, clock, early_data)?;
     writer.write_frame(&frame.encode()).await?;
+
+    // Confirm the ServerAck before handing the connection to the forwarder.
+    let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
+    match Frame::decode(&body)? {
+        Frame::ServerAck { accepted_suite, ek_hash } => {
+            if accepted_suite != est.offered_suite.code() {
+                return Err(OrtError::UnexpectedSuite(accepted_suite));
+            }
+            if ek_hash != est.expected_ek_hash {
+                return Err(OrtError::KeyConfirmation);
+            }
+        }
+        Frame::ServerReject { reason } => return Err(OrtError::Rejected(reason)),
+        _ => return Err(OrtError::Unexpected("expected ServerAck")),
+    }
+
     Ok(ClientOutcome {
         conn: OrtConn {
             reader,
@@ -157,7 +174,6 @@ pub async fn client_0rtt<C: Clock>(
             record: est.record,
             role: Role::Client,
         },
-        expect_ack: Some((est.expected_ek_hash, est.offered_suites)),
         learned: None,
     })
 }
@@ -200,11 +216,12 @@ pub async fn server_accept<C: Clock, G: ReplayGuard>(
                 early_data: established.early_data,
             })
         }
-        ServerStep::OneRtt { hello } => {
+        ServerStep::OneRtt { hello, selected } => {
             writer.write_frame(&hello.encode()).await?;
             let body2 = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
             let frame2 = Frame::decode(&body2)?;
-            let established = server_on_client_data(scfg, &frame2, peer_ip, clock, guard)?;
+            let established =
+                server_on_client_data(scfg, &frame2, peer_ip, clock, guard, selected)?;
             Ok(ServerOutcome {
                 conn: OrtConn {
                     reader,

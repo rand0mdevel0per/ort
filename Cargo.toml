@@ -35,10 +35,6 @@ blake3 = { version = "1", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.9"
 
-# concurrency
-crossbeam-queue = "0.3"
-dashmap = "6"
-
 # wire / framing
 planus = "1"
 

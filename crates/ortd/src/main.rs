@@ -15,12 +15,12 @@ use ort_net::{run_server, SERVERPK_OID_U64};
 use tokio::net::TcpListener;
 
 /// Suites the server can hold keys for.
-const ALL_SUITES: [SuiteId; 2] = [SuiteId::V1MlKem768MlDsa65, SuiteId::V2X25519Ed25519];
+const ALL_SUITES: [SuiteId; 2] = [SuiteId::MlKem768MlDsa65, SuiteId::X25519Ed25519];
 
 fn suite_name(id: SuiteId) -> &'static str {
     match id {
-        SuiteId::V1MlKem768MlDsa65 => "v1",
-        SuiteId::V2X25519Ed25519 => "v2",
+        SuiteId::MlKem768MlDsa65 => "pqc",
+        SuiteId::X25519Ed25519 => "ecdh",
     }
 }
 fn kem_file(id: SuiteId) -> String {
@@ -29,16 +29,18 @@ fn kem_file(id: SuiteId) -> String {
 fn cert_file(id: SuiteId) -> String {
     format!("cert_{}.der", suite_name(id))
 }
+fn cert_signing_file(id: SuiteId) -> String {
+    format!("cert_{}_signing.key", suite_name(id))
+}
 
 fn parse_suites(s: &str) -> Result<Vec<SuiteId>> {
     if s == "all" {
         return Ok(ALL_SUITES.to_vec());
     }
     s.split(',')
-        .map(|p| match p.trim() {
-            "v1" => Ok(SuiteId::V1MlKem768MlDsa65),
-            "v2" => Ok(SuiteId::V2X25519Ed25519),
-            other => anyhow::bail!("unknown suite '{other}' (expected v1, v2 or all)"),
+        .map(|p| {
+            SuiteId::from_name(p.trim())
+                .ok_or_else(|| anyhow::anyhow!("unknown suite '{}' (expected pqc, ecdh or all)", p.trim()))
         })
         .collect()
 }
@@ -121,7 +123,18 @@ fn gen_cert(args: GenArgs) -> Result<()> {
         let key = load_or_make_kem(&args.out, id)?;
         let server_pk = key.public();
 
-        let kp = KeyPair::generate_for(&PKCS_ED25519).context("generate cert key")?;
+        // Reuse the cert signing key across runs so re-issuing a cert keeps a
+        // stable X.509 identity (clients pinning the cert keep working).
+        let signing_path = args.out.join(cert_signing_file(id));
+        let kp = if signing_path.exists() {
+            let der = read_key(&signing_path)?;
+            KeyPair::try_from(&der[..]).context("load cert signing key")?
+        } else {
+            let kp = KeyPair::generate_for(&PKCS_ED25519).context("generate cert key")?;
+            write_key(&signing_path, kp.serialize_der().as_slice())?;
+            kp
+        };
+
         let mut params = CertificateParams::new(vec!["ortd".to_string()]).context("cert params")?;
         params
             .custom_extensions

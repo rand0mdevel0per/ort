@@ -1,20 +1,13 @@
 //! Anti-replay: a [`ReplayGuard`] rejects replayed ClientHellos within the
 //! acceptance window. The handshake depends only on the trait; `ort-net`
-//! provides a lock-free high-concurrency implementation, while this module's
-//! [`StrikeCache`] is a simple mutex-backed version used in tests.
+//! provides a sharded high-concurrency implementation, while this module's
+//! [`StrikeCache`] is a simple mutex-backed version used in tests. The cache
+//! tag is `ConnMeta::replay_tag` — `BLAKE3-256(src_ip || ts || offer_nonce)`,
+//! small and independent of the early data.
 
-use crate::prim;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-/// Compute the replay-cache tag for a ClientHello: `BLAKE3-256(nonce||enc_data)`.
-pub fn replay_tag(nonce: &[u8; 32], enc_data: &[u8]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(32 + enc_data.len());
-    buf.extend_from_slice(nonce);
-    buf.extend_from_slice(enc_data);
-    prim::hash256(&buf)
-}
 
 /// A windowed replay guard. Implementations must be safe to share across tasks
 /// (`&self`), perform an atomic check-and-insert, and not hold any lock across

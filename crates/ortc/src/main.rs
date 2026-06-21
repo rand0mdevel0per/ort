@@ -15,15 +15,12 @@ use ort_net::{run_client, ClientParams, ServerVerifier};
 use tokio::net::TcpListener;
 
 fn parse_suite(s: &str) -> Result<SuiteId> {
-    match s {
-        "v1" => Ok(SuiteId::V1MlKem768MlDsa65),
-        "v2" => Ok(SuiteId::V2X25519Ed25519),
-        other => anyhow::bail!("unknown suite '{other}' (expected v1 or v2)"),
-    }
+    SuiteId::from_name(s.trim())
+        .ok_or_else(|| anyhow::anyhow!("unknown suite '{}' (expected pqc or ecdh)", s.trim()))
 }
 
 fn parse_suites(s: &str) -> Result<Vec<SuiteId>> {
-    s.split(',').map(|p| parse_suite(p.trim())).collect()
+    s.split(',').map(parse_suite).collect()
 }
 
 #[derive(Parser)]
@@ -45,11 +42,11 @@ struct Cli {
     /// DER CA certificate to anchor strict verification to (else self-signed).
     #[arg(long)]
     ca: Option<PathBuf>,
-    /// Signature algorithm for the client identity: `v1` (ML-DSA) or `v2` (Ed25519).
-    #[arg(long, default_value = "v1")]
+    /// Signature algorithm for the client identity: `pqc` (ML-DSA) or `ecdh` (Ed25519).
+    #[arg(long, default_value = "pqc")]
     sig_alg: String,
-    /// KEM suites to offer, in preference order (e.g. `v1,v2`).
-    #[arg(long, default_value = "v1,v2")]
+    /// KEM suites to offer, in preference order (e.g. `pqc,ecdh`).
+    #[arg(long, default_value = "pqc,ecdh")]
     suites: String,
     /// Client signing key file (seed). Generated if the path is absent.
     #[arg(long)]

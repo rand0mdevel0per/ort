@@ -14,8 +14,6 @@ tokio.workspace = true
 rustls-webpki.workspace = true
 rustls-pki-types.workspace = true
 x509-parser.workspace = true
-crossbeam-queue.workspace = true
-dashmap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 

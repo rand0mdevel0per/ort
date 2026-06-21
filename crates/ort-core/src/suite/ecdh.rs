@@ -18,7 +18,7 @@ const ED25519_VK_LEN: usize = 32;
 const ED25519_SIG_LEN: usize = 64;
 
 /// Zero-sized marker type implementing the v2 [`CipherSuite`].
-pub struct V2;
+pub struct Ecdh;
 
 /// Server KEM secret: an X25519 static secret (zeroized on drop by dalek).
 pub struct KemSecret(StaticSecret);
@@ -40,19 +40,21 @@ fn arr32(b: &[u8], what: &'static str) -> Result<[u8; 32]> {
 }
 
 /// DHKEM shared-secret derivation: HKDF over the DH output, binding both the
-/// ephemeral and static public keys (HPKE-style).
+/// ephemeral and static public keys (HPKE-style). The suite label is used as
+/// the HKDF salt (rather than an empty salt) for an extra domain-separation /
+/// security margin.
 fn dhkem_shared(dh: &[u8; 32], eph_pk: &[u8; 32], server_pk: &[u8; 32]) -> [u8; SHARED_LEN] {
     let mut info = Vec::with_capacity(DHKEM_LABEL.len() + 64);
     info.extend_from_slice(DHKEM_LABEL);
     info.extend_from_slice(eph_pk);
     info.extend_from_slice(server_pk);
     let mut out = [0u8; SHARED_LEN];
-    prim::hkdf(dh, &[], &info, &mut out);
+    prim::hkdf(dh, DHKEM_LABEL, &info, &mut out);
     out
 }
 
-impl CipherSuite for V2 {
-    const ID: SuiteId = SuiteId::V2X25519Ed25519;
+impl CipherSuite for Ecdh {
+    const ID: SuiteId = SuiteId::X25519Ed25519;
     const KEM_EK_LEN: usize = X25519_LEN;
     const KEM_CT_LEN: usize = X25519_LEN; // ciphertext == ephemeral public key
     const SIG_VK_LEN: usize = ED25519_VK_LEN;

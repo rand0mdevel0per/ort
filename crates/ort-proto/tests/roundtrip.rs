@@ -7,16 +7,15 @@ fn sample_payload(n_offers: usize) -> KemPayload {
         .map(|i| SuiteOffer {
             suite_id: 0x0001 + i as u16,
             ciphertext: vec![i as u8; 1088],
-            wrapped_enc_sk: vec![0xEE; 48],
+            nonce: [3u8; 32],
+            enc_data: vec![6u8; 500],
         })
         .collect();
     KemPayload {
         offers,
         src_ip: [2u8; 16],
         ts_millis: 0x0102030405060708,
-        nonce: [3u8; 32],
         client_sig: vec![4u8; 3309],
-        enc_data: vec![6u8; 500],
     }
 }
 

@@ -10,7 +10,6 @@ use ort_core::handshake::{ClientConfig, ServerConfig};
 use ort_core::suite::SuiteId;
 use ort_core::time::SystemClock;
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -42,7 +41,7 @@ pub async fn run_server(
             match crate::session::server_accept(sock, peer_ip, &scfg, &*guard, &clock).await {
                 Ok(out) => match TcpStream::connect(target).await {
                     Ok(tstream) => {
-                        if let Err(e) = forward(tstream, out.conn, None, out.early_data).await {
+                        if let Err(e) = forward(tstream, out.conn, out.early_data).await {
                             tracing::debug!(error = %e, "server forward ended");
                         }
                     }
@@ -66,15 +65,19 @@ pub struct ClientParams {
     pub force_1rtt: bool,
 }
 
+/// Cached state from the last successful 1-RTT: the server-observed source IP
+/// and the single suite the server accepted (with its public key). 0-RTT
+/// resumes with exactly this suite (the only one the client holds a key for).
 #[derive(Default)]
 struct Cache {
     observed_ip: Option<[u8; 16]>,
-    pks: HashMap<SuiteId, Vec<u8>>,
+    primary: Option<(SuiteId, Vec<u8>)>,
 }
 
 /// Run the `ortc` client: accept local app connections and tunnel each to the
-/// remote `ortd` at `target`. After first contact it caches the server key(s)
-/// and the server-observed source IP so later connections use 0-RTT.
+/// remote `ortd`. After first contact it records the accepted suite + server
+/// key so later connections use 0-RTT, falling back to 1-RTT if the server no
+/// longer accepts that suite.
 pub async fn run_client(
     listener: TcpListener,
     target: SocketAddr,
@@ -93,6 +96,18 @@ pub async fn run_client(
     }
 }
 
+/// Is this 0-RTT failure recoverable by retrying the same app connection as 1-RTT?
+fn is_zero_rtt_fallback(e: &crate::OrtError) -> bool {
+    matches!(
+        e,
+        crate::OrtError::Rejected(_)
+            | crate::OrtError::UnexpectedSuite(_)
+            | crate::OrtError::KeyConfirmation
+            | crate::OrtError::EarlyClose
+            | crate::OrtError::PinMismatch
+    )
+}
+
 async fn handle_client_conn(
     app_sock: TcpStream,
     target: SocketAddr,
@@ -101,47 +116,40 @@ async fn handle_client_conn(
 ) -> crate::Result<()> {
     let clock = SystemClock;
 
-    // Decide 0-RTT vs 1-RTT from the cache.
+    // Try 0-RTT if we have a cached suite the client still supports.
     let zero_rtt = if params.force_1rtt {
         None
     } else {
         let c = cache.lock().await;
-        c.observed_ip.map(|ip| {
-            let offers: Vec<(SuiteId, Vec<u8>)> = params
-                .kem_suites
-                .iter()
-                .filter_map(|s| c.pks.get(s).map(|pk| (*s, pk.clone())))
-                .collect();
-            (ip, offers)
-        })
+        match (c.observed_ip, &c.primary) {
+            (Some(ip), Some((suite, pk))) if params.kem_suites.contains(suite) => {
+                Some((ip, *suite, pk.clone()))
+            }
+            _ => None,
+        }
     };
 
-    if let Some((observed_ip, offers)) = zero_rtt {
-        if !offers.is_empty() {
-            let ortd = TcpStream::connect(target).await?;
-            let outcome = client_0rtt(ortd, &params.cfg, &offers, observed_ip, &clock, b"").await?;
-            if let Err(e) = forward(app_sock, outcome.conn, outcome.expect_ack, Vec::new()).await {
-                // Likely a stale cache (e.g. NAT rebinding); drop it so the next
-                // connection re-learns via 1-RTT.
-                cache.lock().await.observed_ip = None;
-                return Err(e);
+    if let Some((observed_ip, suite, pk)) = zero_rtt {
+        let ortd = TcpStream::connect(target).await?;
+        match client_0rtt(ortd, &params.cfg, suite, &pk, observed_ip, &clock, b"").await {
+            Ok(outcome) => return forward(app_sock, outcome.conn, Vec::new()).await,
+            Err(e) if is_zero_rtt_fallback(&e) => {
+                tracing::debug!(error = %e, "0-RTT failed; falling back to 1-RTT");
+                cache.lock().await.primary = None; // re-learn via 1-RTT
             }
-            return Ok(());
+            Err(e) => return Err(e),
         }
     }
 
-    // 1-RTT.
+    // 1-RTT (first contact or 0-RTT fallback). `app_sock` is untouched so the
+    // fallback loses no application data.
     let ortd = TcpStream::connect(target).await?;
-    let pinned = {
-        let c = cache.lock().await;
-        params.kem_suites.iter().find_map(|s| c.pks.get(s).cloned())
-    };
     let outcome = client_1rtt(
         ortd,
         &params.cfg,
         &params.kem_suites,
         &params.verifier,
-        pinned.as_deref(),
+        None,
         &clock,
         b"",
     )
@@ -149,8 +157,7 @@ async fn handle_client_conn(
     if let Some(learned) = &outcome.learned {
         let mut c = cache.lock().await;
         c.observed_ip = Some(learned.observed_ip);
-        c.pks
-            .insert(learned.accepted_suite, learned.server_pk.clone());
+        c.primary = Some((learned.accepted_suite, learned.server_pk.clone()));
     }
-    forward(app_sock, outcome.conn, outcome.expect_ack, Vec::new()).await
+    forward(app_sock, outcome.conn, Vec::new()).await
 }

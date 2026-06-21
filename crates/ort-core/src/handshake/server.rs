@@ -2,15 +2,16 @@
 
 use super::offers_hash;
 use crate::connmeta::{verify_client_binding, ConnMeta};
-use crate::kdf::{derive_session_keys, unwrap_enc_sk};
+use crate::kdf::derive_session_keys;
 use crate::pool::Direction;
 use crate::record::RecordLayer;
-use crate::replay::{replay_tag, ReplayGuard};
+use crate::replay::ReplayGuard;
 use crate::suite::agile::{suite_from_code, ServerKemKey};
 use crate::suite::SuiteId;
 use crate::time::{check_window, Clock};
 use crate::{Error, Result};
-use ort_proto::{reject, Frame, KemPayload};
+use ort_proto::{reject, Frame, KemPayload, SuiteOffer};
+use zeroize::Zeroizing;
 
 /// A server KEM keypair for one suite, with its optional binding certificate.
 pub struct SuiteKey {
@@ -56,10 +57,12 @@ pub enum ServerStep {
         /// Established session.
         established: ServerEstablished,
     },
-    /// 1-RTT: send `hello`, await ClientData.
+    /// 1-RTT: send `hello`, await ClientData for `selected`.
     OneRtt {
         /// ServerHello frame.
         hello: Frame,
+        /// Suite the server selected (the ClientData offer must match it).
+        selected: SuiteId,
     },
     /// Refuse the connection (send `frame`, then close).
     Reject {
@@ -68,25 +71,32 @@ pub enum ServerStep {
     },
 }
 
-/// Pick the first client-offered suite (client preference order) the server
-/// supports, returning its wire index.
+/// Pick the offered suite to use. With `expected = Some(s)` (1-RTT second
+/// flight) the offer must be exactly `s`; otherwise the first client-offered
+/// suite the server supports (client preference order) is chosen.
 fn select_offered<'a>(
     cfg: &'a ServerConfig,
-    payload: &KemPayload,
-) -> Option<(usize, &'a SuiteKey)> {
-    for (i, offer) in payload.offers.iter().enumerate() {
-        if let Some(suite) = SuiteId::from_code(offer.suite_id) {
-            if let Some(key) = cfg.find(suite) {
-                return Some((i, key));
+    payload: &'a KemPayload,
+    expected: Option<SuiteId>,
+) -> Option<(&'a SuiteOffer, &'a SuiteKey)> {
+    for offer in &payload.offers {
+        let Some(suite) = SuiteId::from_code(offer.suite_id) else { continue };
+        if let Some(exp) = expected {
+            if suite != exp {
+                continue;
             }
+        }
+        if let Some(key) = cfg.find(suite) {
+            return Some((offer, key));
         }
     }
     None
 }
 
 /// Validate and process a client KEM payload. Order is fail-fast/DoS-aware:
-/// cheap public checks, then the client signature (authenticates the payload),
-/// then the replay guard, then suite selection + the expensive KEM work.
+/// cheap public checks and suite selection first (so unsupported-suite spam is
+/// rejected without expensive signature work), then the client signature, then
+/// the replay guard, then the KEM/AEAD work.
 fn process_payload<C: Clock, G: ReplayGuard>(
     cfg: &ServerConfig,
     client_pk: &[u8],
@@ -95,6 +105,7 @@ fn process_payload<C: Clock, G: ReplayGuard>(
     peer_ip: [u8; 16],
     clock: &C,
     guard: &G,
+    expected: Option<SuiteId>,
 ) -> Result<(SuiteId, ServerEstablished)> {
     let now = clock.now_millis();
     let sig_alg = suite_from_code(sig_alg_code)?;
@@ -105,38 +116,20 @@ fn process_payload<C: Clock, G: ReplayGuard>(
     }
     // (b) timestamp window
     check_window(now, payload.ts_millis, cfg.window_ms, cfg.skew_ms)?;
-    // (c) client binding signature (authenticates offers + enc_data + version)
-    let cm = ConnMeta {
-        src_ip: payload.src_ip,
-        ts_millis: payload.ts_millis,
-        nonce: payload.nonce,
-    };
-    let oh = offers_hash(&payload.offers);
-    verify_client_binding(
-        sig_alg,
-        client_pk,
-        &cm,
-        &oh,
-        &payload.enc_data,
-        &payload.client_sig,
-    )?;
-    // (d) replay strike guard (authenticated payloads only)
-    guard.check_and_insert(replay_tag(&payload.nonce, &payload.enc_data), now)?;
-    // (e) select a mutually-supported suite
-    let (idx, suite_key) = select_offered(cfg, payload).ok_or(Error::NoCommonSuite)?;
-    let offer = &payload.offers[idx];
+    // (c) select a mutually-supported suite *before* the expensive signature
+    let (offer, suite_key) = select_offered(cfg, payload, expected).ok_or(Error::NoCommonSuite)?;
     let accepted = suite_key.key.suite_id();
-    // (f) decapsulate, unwrap enc_sk, derive keys, open early data
-    let shared = suite_key.key.decapsulate(&offer.ciphertext)?;
-    let enc_sk = unwrap_enc_sk(
-        &shared,
-        &offer.ciphertext,
-        offer.suite_id,
-        &offer.wrapped_enc_sk,
-    )?;
-    let keys = derive_session_keys(&enc_sk, &payload.nonce);
-    let mut record = RecordLayer::new(keys, &payload.nonce);
-    let early_data = record.open(Direction::ClientToServer, &payload.enc_data)?;
+    // (d) client binding signature (authenticates all offers + version + sig_alg)
+    let cm = ConnMeta { src_ip: payload.src_ip, ts_millis: payload.ts_millis };
+    let oh = offers_hash(&payload.offers);
+    verify_client_binding(sig_alg, client_pk, &cm, &oh, &payload.client_sig)?;
+    // (e) replay strike guard (authenticated payloads only)
+    guard.check_and_insert(cm.replay_tag(&offer.nonce), now)?;
+    // (f) decapsulate, derive keys from shared secret, open early data
+    let shared = Zeroizing::new(suite_key.key.decapsulate(&offer.ciphertext)?);
+    let keys = derive_session_keys(&shared, &offer.nonce);
+    let mut record = RecordLayer::new(keys, &offer.nonce);
+    let early_data = record.open(Direction::ClientToServer, &offer.enc_data)?;
 
     Ok((accepted, ServerEstablished { record, early_data }))
 }
@@ -154,10 +147,7 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
     guard: &G,
 ) -> Result<ServerStep> {
     match frame {
-        Frame::ClientHelloOneRtt {
-            available_suites, ..
-        } => {
-            // Pick the first client-preferred suite the server supports.
+        Frame::ClientHelloOneRtt { available_suites, .. } => {
             let chosen = available_suites
                 .iter()
                 .filter_map(|c| SuiteId::from_code(*c))
@@ -171,50 +161,53 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                         observed_ip: peer_ip,
                         server_ts: clock.now_millis(),
                     },
+                    selected: suite_key.key.suite_id(),
                 }),
-                None => Ok(ServerStep::Reject {
-                    frame: reject_frame(reject::NO_COMMON_SUITE),
-                }),
+                None => Ok(ServerStep::Reject { frame: reject_frame(reject::NO_COMMON_SUITE) }),
             }
         }
-        Frame::ClientHelloZeroRtt {
-            client_pk,
-            sig_alg,
-            payload,
-        } => match process_payload(cfg, client_pk, *sig_alg, payload, peer_ip, clock, guard) {
-            Ok((accepted_suite, established)) => Ok(ServerStep::ZeroRtt {
-                accepted_suite,
-                ack: Frame::ServerAck {
-                    accepted_suite: accepted_suite.code(),
-                    ek_hash: established.record.enc_key_hash(),
-                },
-                established,
-            }),
-            Err(Error::NoCommonSuite) => Ok(ServerStep::Reject {
-                frame: reject_frame(reject::NO_COMMON_SUITE),
-            }),
-            Err(e) => Err(e),
-        },
+        Frame::ClientHelloZeroRtt { client_pk, sig_alg, payload } => {
+            match process_payload(cfg, client_pk, *sig_alg, payload, peer_ip, clock, guard, None) {
+                Ok((accepted_suite, established)) => Ok(ServerStep::ZeroRtt {
+                    accepted_suite,
+                    ack: Frame::ServerAck {
+                        accepted_suite: accepted_suite.code(),
+                        ek_hash: established.record.enc_key_hash(),
+                    },
+                    established,
+                }),
+                Err(Error::NoCommonSuite) => {
+                    Ok(ServerStep::Reject { frame: reject_frame(reject::NO_COMMON_SUITE) })
+                }
+                Err(e) => Err(e),
+            }
+        }
         _ => Err(Error::UnexpectedMessage("server_on_first")),
     }
 }
 
-/// Process the 1-RTT second flight ([`Frame::ClientData`]).
+/// Process the 1-RTT second flight ([`Frame::ClientData`]); the offer must be
+/// for `expected` (the suite announced in ServerHello).
 pub fn server_on_client_data<C: Clock, G: ReplayGuard>(
     cfg: &ServerConfig,
     frame: &Frame,
     peer_ip: [u8; 16],
     clock: &C,
     guard: &G,
+    expected: SuiteId,
 ) -> Result<ServerEstablished> {
     match frame {
-        Frame::ClientData {
-            client_pk,
-            sig_alg,
-            payload,
-        } => {
-            let (_suite, established) =
-                process_payload(cfg, client_pk, *sig_alg, payload, peer_ip, clock, guard)?;
+        Frame::ClientData { client_pk, sig_alg, payload } => {
+            let (_suite, established) = process_payload(
+                cfg,
+                client_pk,
+                *sig_alg,
+                payload,
+                peer_ip,
+                clock,
+                guard,
+                Some(expected),
+            )?;
             Ok(established)
         }
         _ => Err(Error::UnexpectedMessage("server_on_client_data")),

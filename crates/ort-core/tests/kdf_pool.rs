@@ -1,37 +1,31 @@
-//! Key-schedule (DEK derivation + enc_sk wrapping) and entropy-pool tests.
+//! Key-schedule (direct KDF from shared secret) and entropy-pool tests.
 
-use ort_core::kdf::{derive_session_keys, unwrap_enc_sk, wrap_enc_sk};
+use ort_core::kdf::derive_session_keys;
 use ort_core::pool::{Direction, EntropyPool};
 use std::collections::HashSet;
 
 #[test]
 fn session_keys_deterministic_and_nonce_sensitive() {
-    let enc_sk = [0x11u8; 32];
+    let shared = [0x11u8; 32];
     let n1 = [0x22u8; 32];
     let n2 = [0x23u8; 32];
-    let a = derive_session_keys(&enc_sk, &n1);
-    let b = derive_session_keys(&enc_sk, &n1);
-    let c = derive_session_keys(&enc_sk, &n2);
+    let a = derive_session_keys(&shared, &n1);
+    let b = derive_session_keys(&shared, &n1);
+    let c = derive_session_keys(&shared, &n2);
     assert_eq!(a.enc_key, b.enc_key);
     assert_ne!(a.enc_key, c.enc_key);
     assert_ne!(a.enc_key, a.pool_key);
 }
 
 #[test]
-fn enc_sk_wrap_roundtrip() {
-    let shared = [0x42u8; 32];
-    let ct = vec![0x55u8; 1088];
-    let enc_sk = [0x77u8; 32];
-    let wrapped = wrap_enc_sk(&shared, &ct, 0x0001, &enc_sk);
-    let got = unwrap_enc_sk(&shared, &ct, 0x0001, &wrapped).unwrap();
-    assert_eq!(&got[..], &enc_sk);
-
-    // wrong shared secret fails authentication
-    assert!(unwrap_enc_sk(&[0u8; 32], &ct, 0x0001, &wrapped).is_err());
-    // wrong suite-id AAD fails
-    assert!(unwrap_enc_sk(&shared, &ct, 0x0002, &wrapped).is_err());
-    // wrong ciphertext binding fails
-    assert!(unwrap_enc_sk(&shared, &vec![0u8; 1088], 0x0001, &wrapped).is_err());
+fn different_shared_secrets_yield_different_keys() {
+    let shared1 = [0x42u8; 32];
+    let shared2 = [0x43u8; 32];
+    let nonce = [0x77u8; 32];
+    let keys1 = derive_session_keys(&shared1, &nonce);
+    let keys2 = derive_session_keys(&shared2, &nonce);
+    assert_ne!(keys1.enc_key, keys2.enc_key);
+    assert_ne!(keys1.pool_key, keys2.pool_key);
 }
 
 #[test]

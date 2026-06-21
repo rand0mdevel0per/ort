@@ -24,7 +24,7 @@ const ML_DSA_65_SIG: usize = 3309;
 const ML_DSA_65_SEED: usize = 32;
 
 /// Zero-sized marker type implementing the v1 [`CipherSuite`].
-pub struct V1;
+pub struct Pqc;
 
 /// Server KEM secret. Stored as its zeroizing `(d || z)` seed; the live
 /// decapsulation key is reconstructed per operation so the long-term secret is
@@ -54,8 +54,8 @@ impl SigSecret {
     }
 }
 
-impl CipherSuite for V1 {
-    const ID: SuiteId = SuiteId::V1MlKem768MlDsa65;
+impl CipherSuite for Pqc {
+    const ID: SuiteId = SuiteId::MlKem768MlDsa65;
     const KEM_EK_LEN: usize = ML_KEM_768_EK;
     const KEM_CT_LEN: usize = ML_KEM_768_CT;
     const SIG_VK_LEN: usize = ML_DSA_65_VK;

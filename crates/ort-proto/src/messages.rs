@@ -56,37 +56,40 @@ impl FrameType {
     }
 }
 
-/// One per-suite offer: a KEM encapsulation against that suite's server key,
-/// plus the session key (`enc_sk`) wrapped under the resulting shared secret.
+/// One self-contained per-suite offer. Each offer is cryptographically
+/// independent: its own KEM encapsulation against that suite's server key, its
+/// own fresh `nonce`, and its own early data. The session key (`enc_sk`) is
+/// derived on both peers from this offer's KEM shared secret and `nonce`, so no
+/// key is shared across suites (no weakest-link) and nothing extra is wrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteOffer {
     /// Cipher-suite id this offer is for.
     pub suite_id: u16,
     /// KEM ciphertext (encapsulation against the suite's server public key).
     pub ciphertext: Vec<u8>,
-    /// `enc_sk` sealed under a key derived from this offer's shared secret.
-    pub wrapped_enc_sk: Vec<u8>,
+    /// Fresh per-offer nonce (salts the key schedule and the replay tag).
+    pub nonce: [u8; 32],
+    /// Early data sealed under this offer's derived `enc_sk`. The record nonce
+    /// is pool-derived (not transmitted).
+    pub enc_data: Vec<u8>,
 }
 
 /// The client's KEM-bearing payload (0-RTT ClientHello or 1-RTT ClientData).
 ///
-/// A single random session key `enc_sk` encrypts `enc_data`; each offer wraps a
-/// copy of `enc_sk` for one suite, so the server can adopt whichever offered
-/// suite it supports without an extra round trip.
+/// 0-RTT carries a single offer (the previously-negotiated suite); 1-RTT
+/// advertises suites in [`Frame::ClientHelloOneRtt`] and the ClientData carries
+/// the one offer the server selected. The wire format permits multiple offers
+/// for forward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KemPayload {
-    /// One or more per-suite offers (at least one).
+    /// One or more self-contained per-suite offers (at least one).
     pub offers: Vec<SuiteOffer>,
     /// Client source IP (16 bytes; for 1-RTT this echoes the server-observed IP).
     pub src_ip: [u8; 16],
     /// Client timestamp in milliseconds since the Unix epoch.
     pub ts_millis: u64,
-    /// Fresh per-connection nonce.
-    pub nonce: [u8; 32],
-    /// ML-DSA/Ed25519 signature over the client binding string.
+    /// Signature over the client binding string (one signature, under `sig_alg`).
     pub client_sig: Vec<u8>,
-    /// AEAD-sealed early data under `enc_sk`. The record nonce is pool-derived.
-    pub enc_data: Vec<u8>,
 }
 
 impl KemPayload {
@@ -95,13 +98,10 @@ impl KemPayload {
         for o in &self.offers {
             w.u16(o.suite_id)
                 .bytes(&o.ciphertext)
-                .bytes(&o.wrapped_enc_sk);
+                .raw(&o.nonce)
+                .bytes(&o.enc_data);
         }
-        w.raw(&self.src_ip)
-            .u64(self.ts_millis)
-            .raw(&self.nonce)
-            .bytes(&self.client_sig)
-            .bytes(&self.enc_data);
+        w.raw(&self.src_ip).u64(self.ts_millis).bytes(&self.client_sig);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, ProtoError> {
@@ -117,16 +117,15 @@ impl KemPayload {
             offers.push(SuiteOffer {
                 suite_id: r.u16()?,
                 ciphertext: r.bytes()?.to_vec(),
-                wrapped_enc_sk: r.bytes()?.to_vec(),
+                nonce: r.array::<32>()?,
+                enc_data: r.bytes()?.to_vec(),
             });
         }
         Ok(KemPayload {
             offers,
             src_ip: r.array::<16>()?,
             ts_millis: r.u64()?,
-            nonce: r.array::<32>()?,
             client_sig: r.bytes()?.to_vec(),
-            enc_data: r.bytes()?.to_vec(),
         })
     }
 }

@@ -7,6 +7,7 @@ use crate::kdf::SessionKeys;
 use crate::pool::{DirChannel, Direction, EntropyPool};
 use crate::prim::{self, NONCE_LEN};
 use crate::Result;
+use zeroize::Zeroizing;
 
 /// AAD domain label (10 bytes) bound into every record.
 pub const RECORD_AAD_LABEL: &[u8; 10] = b"ORT-v1 rec";
@@ -63,7 +64,7 @@ impl RecordLayer {
     /// driven by separate tasks with no shared lock (true full duplex).
     /// `send_dir` is the direction this peer seals into.
     pub fn split(self, send_dir: Direction) -> (RecordSender, RecordReceiver) {
-        let enc_key = self.keys.enc_key;
+        let enc_key = Zeroizing::new(self.keys.enc_key);
         let (c2s, s2c) = self.pool.split();
         let (send_chan, recv_chan) = match send_dir {
             Direction::ClientToServer => (c2s, s2c),
@@ -71,7 +72,7 @@ impl RecordLayer {
         };
         (
             RecordSender {
-                enc_key,
+                enc_key: enc_key.clone(),
                 chan: send_chan,
             },
             RecordReceiver {
@@ -82,9 +83,10 @@ impl RecordLayer {
     }
 }
 
-/// The sending half of a split record layer (one direction).
+/// The sending half of a split record layer (one direction). The key is held in
+/// a `Zeroizing` wrapper so it is wiped when the half is dropped.
 pub struct RecordSender {
-    enc_key: [u8; 32],
+    enc_key: Zeroizing<[u8; 32]>,
     chan: DirChannel,
 }
 
@@ -105,9 +107,10 @@ impl RecordSender {
     }
 }
 
-/// The receiving half of a split record layer (one direction).
+/// The receiving half of a split record layer (one direction). The key is held
+/// in a `Zeroizing` wrapper so it is wiped when the half is dropped.
 pub struct RecordReceiver {
-    enc_key: [u8; 32],
+    enc_key: Zeroizing<[u8; 32]>,
     chan: DirChannel,
 }
 

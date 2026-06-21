@@ -89,9 +89,9 @@ async fn boot(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn echo_v1_1rtt_then_0rtt() {
     let ortc = boot(
-        &[SuiteId::V1MlKem768MlDsa65],
-        SuiteId::V1MlKem768MlDsa65,
-        vec![SuiteId::V1MlKem768MlDsa65],
+        &[SuiteId::MlKem768MlDsa65],
+        SuiteId::MlKem768MlDsa65,
+        vec![SuiteId::MlKem768MlDsa65],
     )
     .await;
     echo_once(ortc, &make_payload(13)).await; // 1-RTT
@@ -103,9 +103,9 @@ async fn echo_v1_1rtt_then_0rtt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn echo_v2_classical() {
     let ortc = boot(
-        &[SuiteId::V2X25519Ed25519],
-        SuiteId::V2X25519Ed25519,
-        vec![SuiteId::V2X25519Ed25519],
+        &[SuiteId::X25519Ed25519],
+        SuiteId::X25519Ed25519,
+        vec![SuiteId::X25519Ed25519],
     )
     .await;
     echo_once(ortc, &make_payload(64)).await;
@@ -116,9 +116,9 @@ async fn echo_v2_classical() {
 async fn echo_negotiation_server_both_client_prefers_v1() {
     // Server supports both; client signs with Ed25519 (v2) but offers v1 then v2.
     let ortc = boot(
-        &[SuiteId::V2X25519Ed25519, SuiteId::V1MlKem768MlDsa65],
-        SuiteId::V2X25519Ed25519,
-        vec![SuiteId::V1MlKem768MlDsa65, SuiteId::V2X25519Ed25519],
+        &[SuiteId::X25519Ed25519, SuiteId::MlKem768MlDsa65],
+        SuiteId::X25519Ed25519,
+        vec![SuiteId::MlKem768MlDsa65, SuiteId::X25519Ed25519],
     )
     .await;
     echo_once(ortc, &make_payload(1000)).await;

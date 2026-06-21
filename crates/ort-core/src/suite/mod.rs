@@ -2,7 +2,7 @@
 //!
 //! Every primitive the protocol needs is exposed through [`CipherSuite`] using
 //! byte-oriented signatures so the handshake/record code never touches a
-//! concrete crypto crate's generic types. v1 ([`v1::V1`]) binds:
+//! concrete crypto crate's generic types. PQC ([`pqc::Pqc`]) binds:
 //! ML-KEM-768 + ML-DSA-65 + AES-256-GCM + HKDF-SHA256 + BLAKE3.
 //!
 //! Key agreement is a **KEM** (not a NIKE): the client picks a fresh 32-byte
@@ -12,9 +12,9 @@
 //! fresh per connection, every session has an independent shared secret.
 
 pub mod agile;
-pub mod classical;
+pub mod ecdh;
 pub mod ids;
-pub mod v1;
+pub mod pqc;
 
 pub use ids::SuiteId;
 

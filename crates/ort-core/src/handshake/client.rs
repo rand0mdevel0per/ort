@@ -2,7 +2,7 @@
 
 use super::offers_hash;
 use crate::connmeta::{sign_client_binding, ConnMeta};
-use crate::kdf::{derive_session_keys, generate_enc_sk, wrap_enc_sk};
+use crate::kdf::derive_session_keys;
 use crate::pool::Direction;
 use crate::record::RecordLayer;
 use crate::suite::agile::{self, SigIdentity};
@@ -10,6 +10,7 @@ use crate::suite::{fresh_r, SuiteId};
 use crate::time::Clock;
 use crate::Result;
 use ort_proto::{Frame, KemPayload, SuiteOffer};
+use zeroize::Zeroizing;
 
 /// Per-client configuration (the client's long-term signing identity).
 pub struct ClientConfig {
@@ -33,66 +34,44 @@ pub struct ClientEstablished {
     pub record: RecordLayer,
     /// Expected `BLAKE3-512(enc_key)`, to validate the server's ServerAck.
     pub expected_ek_hash: [u8; 64],
-    /// Suite ids that were offered, so the client can check the accepted suite.
-    pub offered_suites: Vec<SuiteId>,
+    /// The suite that was offered (to check the server's accepted suite).
+    pub offered_suite: SuiteId,
 }
 
-/// Build the multi-suite KEM payload + record layer. `offers` pairs each suite
-/// with the server public key the client holds for it.
+/// Build a single self-contained offer + the record layer. Each connection
+/// derives its session keys directly from the KEM shared secret and a fresh
+/// nonce, so each suite's keys are cryptographically independent.
 fn build_payload<C: Clock>(
     cfg: &ClientConfig,
-    offers: &[(SuiteId, Vec<u8>)],
+    suite: SuiteId,
+    server_pk: &[u8],
     src_ip: [u8; 16],
     clock: &C,
     early_data: &[u8],
 ) -> Result<(KemPayload, ClientEstablished)> {
-    let enc_sk = generate_enc_sk()?;
     let mut nonce = [0u8; 32];
     crate::suite::fill_random(&mut nonce)?;
 
-    let keys = derive_session_keys(&enc_sk, &nonce);
+    // Encapsulate against this suite's server key; derive session keys from the
+    // shared secret (zeroized immediately after).
+    let r = fresh_r()?;
+    let (ciphertext, shared) = agile::kem_encapsulate(suite, server_pk, &r)?;
+    let shared = Zeroizing::new(shared);
+    let keys = derive_session_keys(&shared, &nonce);
+
     let mut record = RecordLayer::new(keys, &nonce);
     let expected_ek_hash = record.enc_key_hash();
     let enc_data = record.seal(Direction::ClientToServer, early_data);
 
-    let mut wire_offers = Vec::with_capacity(offers.len());
-    let mut offered_suites = Vec::with_capacity(offers.len());
-    for (suite, server_pk) in offers {
-        let r = fresh_r()?;
-        let (ciphertext, shared) = agile::kem_encapsulate(*suite, server_pk, &r)?;
-        let wrapped_enc_sk = wrap_enc_sk(&shared, &ciphertext, suite.code(), &enc_sk);
-        wire_offers.push(SuiteOffer {
-            suite_id: suite.code(),
-            ciphertext,
-            wrapped_enc_sk,
-        });
-        offered_suites.push(*suite);
-    }
+    let offer = SuiteOffer { suite_id: suite.code(), ciphertext, nonce, enc_data };
+    let offers = vec![offer];
+    let oh = offers_hash(&offers);
 
-    let oh = offers_hash(&wire_offers);
-    let cm = ConnMeta {
-        src_ip,
-        ts_millis: clock.now_millis(),
-        nonce,
-    };
-    let client_sig = sign_client_binding(&cfg.sig, &cm, &cfg.client_pk, &oh, &enc_data);
+    let cm = ConnMeta { src_ip, ts_millis: clock.now_millis() };
+    let client_sig = sign_client_binding(&cfg.sig, &cm, &cfg.client_pk, &oh);
 
-    let payload = KemPayload {
-        offers: wire_offers,
-        src_ip: cm.src_ip,
-        ts_millis: cm.ts_millis,
-        nonce: cm.nonce,
-        client_sig,
-        enc_data,
-    };
-    Ok((
-        payload,
-        ClientEstablished {
-            record,
-            expected_ek_hash,
-            offered_suites,
-        },
-    ))
+    let payload = KemPayload { offers, src_ip: cm.src_ip, ts_millis: cm.ts_millis, client_sig };
+    Ok((payload, ClientEstablished { record, expected_ek_hash, offered_suite: suite }))
 }
 
 /// 1-RTT step 1: advertise supported KEM suites + the signature algorithm.
@@ -104,15 +83,16 @@ pub fn client_one_rtt_hello(cfg: &ClientConfig, available: &[SuiteId]) -> Frame 
     }
 }
 
-/// 0-RTT: offer one or more cached suites with early data.
+/// 0-RTT: resume with a single cached suite, sending early data.
 pub fn client_offer_zero_rtt<C: Clock>(
     cfg: &ClientConfig,
-    offers: &[(SuiteId, Vec<u8>)],
+    suite: SuiteId,
+    server_pk: &[u8],
     src_ip: [u8; 16],
     clock: &C,
     early_data: &[u8],
 ) -> Result<(Frame, ClientEstablished)> {
-    let (payload, est) = build_payload(cfg, offers, src_ip, clock, early_data)?;
+    let (payload, est) = build_payload(cfg, suite, server_pk, src_ip, clock, early_data)?;
     let frame = Frame::ClientHelloZeroRtt {
         client_pk: cfg.client_pk.clone(),
         sig_alg: cfg.sig.suite_id().code(),
@@ -131,8 +111,7 @@ pub fn client_one_rtt_finish<C: Clock>(
     clock: &C,
     early_data: &[u8],
 ) -> Result<(Frame, ClientEstablished)> {
-    let offers = [(accepted_suite, server_pk.to_vec())];
-    let (payload, est) = build_payload(cfg, &offers, src_ip, clock, early_data)?;
+    let (payload, est) = build_payload(cfg, accepted_suite, server_pk, src_ip, clock, early_data)?;
     let frame = Frame::ClientData {
         client_pk: cfg.client_pk.clone(),
         sig_alg: cfg.sig.suite_id().code(),

@@ -9,7 +9,6 @@
 use crate::error::{OrtError, Result};
 use crate::session::{OrtConn, Role};
 
-use ort_core::suite::SuiteId;
 use ort_proto::Frame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,25 +21,13 @@ fn invalid(e: ort_core::Error) -> OrtError {
 }
 
 /// Pump bytes between `plain` (the local app or backend target) and the ORT
-/// tunnel `conn`.
+/// tunnel `conn`. The handshake (including any ServerAck key confirmation) is
+/// already complete by the time this is called.
 ///
-/// - `expect_ack`: for client 0-RTT, `(expected ek_hash, offered suites)`; the
-///   first inbound frame must be a matching ServerAck (else the connection is
-///   torn down).
-/// - `early_to_plain`: decrypted early data (server side) to flush before pumping.
-pub async fn forward(
-    plain: TcpStream,
-    conn: OrtConn,
-    expect_ack: Option<([u8; 64], Vec<SuiteId>)>,
-    early_to_plain: Vec<u8>,
-) -> Result<()> {
+/// `early_to_plain` is decrypted early data (server side) to flush before pumping.
+pub async fn forward(plain: TcpStream, conn: OrtConn, early_to_plain: Vec<u8>) -> Result<()> {
     let _ = plain.set_nodelay(true);
-    let OrtConn {
-        reader,
-        mut writer,
-        record,
-        role,
-    } = conn;
+    let OrtConn { reader, mut writer, record, role } = conn;
     let send_from_server = matches!(role, Role::Server);
     let expect_from_server = !send_from_server;
 
@@ -59,10 +46,7 @@ pub async fn forward(
                 break;
             }
             let ct = sender.seal(&buf[..n]);
-            let frame = Frame::DataRecord {
-                from_server: send_from_server,
-                ciphertext: ct,
-            };
+            let frame = Frame::DataRecord { from_server: send_from_server, ciphertext: ct };
             writer.write_frame(&frame.encode()).await?;
         }
         let _ = writer.write_frame(&Frame::Close.encode()).await;
@@ -73,36 +57,11 @@ pub async fn forward(
     // tunnel -> plain
     let mut reader = reader;
     let down = tokio::spawn(async move {
-        if let Some((expected, offered)) = expect_ack {
-            match reader.read_frame().await? {
-                None => return Err(OrtError::EarlyClose),
-                Some(body) => match Frame::decode(&body)? {
-                    Frame::ServerAck {
-                        accepted_suite,
-                        ek_hash,
-                    } => {
-                        let s = SuiteId::from_code(accepted_suite)
-                            .ok_or(OrtError::UnexpectedSuite(accepted_suite))?;
-                        if !offered.contains(&s) {
-                            return Err(OrtError::UnexpectedSuite(accepted_suite));
-                        }
-                        if ek_hash != expected {
-                            return Err(OrtError::KeyConfirmation);
-                        }
-                    }
-                    Frame::ServerReject { reason } => return Err(OrtError::Rejected(reason)),
-                    _ => return Err(OrtError::Unexpected("expected ServerAck")),
-                },
-            }
-        }
         loop {
             match reader.read_frame().await? {
                 None => break,
                 Some(body) => match Frame::decode(&body)? {
-                    Frame::DataRecord {
-                        from_server,
-                        ciphertext,
-                    } => {
+                    Frame::DataRecord { from_server, ciphertext } => {
                         if from_server != expect_from_server {
                             return Err(OrtError::Unexpected("wrong record direction"));
                         }
@@ -121,11 +80,10 @@ pub async fn forward(
     // Whichever direction ends first aborts the other (no deadlock, no leak).
     let up_abort = up.abort_handle();
     let down_abort = down.abort_handle();
-    let result = tokio::select! {
+    tokio::select! {
         r = up => { down_abort.abort(); flatten(r) }
         r = down => { up_abort.abort(); flatten(r) }
-    };
-    result
+    }
 }
 
 fn flatten(join: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {

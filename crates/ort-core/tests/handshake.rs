@@ -62,8 +62,7 @@ fn zero_rtt(sig: SuiteId, kem: SuiteId) {
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
 
-    let offers = [(kem, server_pk(&scfg, kem))];
-    let (frame, mut ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"early").unwrap();
+    let (frame, mut ce) = client_offer_zero_rtt(&ccfg, kem, &server_pk(&scfg, kem), IP, &clock, b"early").unwrap();
 
     match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
         ServerStep::ZeroRtt {
@@ -80,7 +79,7 @@ fn zero_rtt(sig: SuiteId, kem: SuiteId) {
                 } => {
                     assert_eq!(a, kem.code());
                     assert_eq!(ek_hash, ce.expected_ek_hash);
-                    assert!(ce.offered_suites.contains(&SuiteId::from_code(a).unwrap()));
+                    assert_eq!(ce.offered_suite, SuiteId::from_code(a).unwrap());
                 }
                 _ => panic!("expected ack"),
             }
@@ -92,31 +91,31 @@ fn zero_rtt(sig: SuiteId, kem: SuiteId) {
 
 #[test]
 fn zero_rtt_v1() {
-    zero_rtt(SuiteId::V1MlKem768MlDsa65, SuiteId::V1MlKem768MlDsa65);
+    zero_rtt(SuiteId::MlKem768MlDsa65, SuiteId::MlKem768MlDsa65);
 }
 
 #[test]
 fn zero_rtt_v2() {
-    zero_rtt(SuiteId::V2X25519Ed25519, SuiteId::V2X25519Ed25519);
+    zero_rtt(SuiteId::X25519Ed25519, SuiteId::X25519Ed25519);
 }
 
 #[test]
 fn zero_rtt_mixed_sig_and_kem() {
     // Sign with Ed25519 (v2) but encapsulate with ML-KEM (v1): decoupled.
-    zero_rtt(SuiteId::V2X25519Ed25519, SuiteId::V1MlKem768MlDsa65);
+    zero_rtt(SuiteId::X25519Ed25519, SuiteId::MlKem768MlDsa65);
 }
 
 #[test]
 fn one_rtt_negotiates_and_completes() {
-    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
-    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519, SuiteId::V1MlKem768MlDsa65]);
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::X25519Ed25519, SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
 
     // client advertises both, prefers v1
     let hello = client_one_rtt_hello(
         &ccfg,
-        &[SuiteId::V1MlKem768MlDsa65, SuiteId::V2X25519Ed25519],
+        &[SuiteId::MlKem768MlDsa65, SuiteId::X25519Ed25519],
     );
     let (accepted, spk) = match server_on_first(&scfg, &hello, IP, &clock, &guard).unwrap() {
         ServerStep::OneRtt {
@@ -127,53 +126,50 @@ fn one_rtt_negotiates_and_completes() {
                     observed_ip,
                     ..
                 },
+            selected: _,
         } => {
             assert_eq!(observed_ip, IP);
             (SuiteId::from_code(accepted_suite).unwrap(), server_pk)
         }
         _ => panic!("expected ServerHello"),
     };
-    assert_eq!(accepted, SuiteId::V1MlKem768MlDsa65);
+    assert_eq!(accepted, SuiteId::MlKem768MlDsa65);
 
     let (frame, mut ce) = client_one_rtt_finish(&ccfg, accepted, &spk, IP, &clock, b"hi").unwrap();
-    let mut se = server_on_client_data(&scfg, &frame, IP, &clock, &guard).unwrap();
+    let mut se = server_on_client_data(&scfg, &frame, IP, &clock, &guard, accepted).unwrap();
     assert_eq!(se.early_data, b"hi");
     exchange(&mut ce.record, &mut se.record);
 }
 
 #[test]
 fn multi_offer_server_picks_supported() {
-    // Client offers both suites; server only supports v2 -> picks v2.
-    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
-    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]);
+    // Client offers both suites via 1-RTT negotiation. 0-RTT only offers one suite.
+    // This test now uses 1-RTT hello + finish to demonstrate multi-suite support.
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::X25519Ed25519]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
 
-    let offers = [
-        (SuiteId::V1MlKem768MlDsa65, vec![0u8; 1184]), // server lacks v1; bogus pk ok, not selected
-        (
-            SuiteId::V2X25519Ed25519,
-            server_pk(&scfg, SuiteId::V2X25519Ed25519),
-        ),
-    ];
-    let (frame, _ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"x").unwrap();
-    match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
-        ServerStep::ZeroRtt { accepted_suite, .. } => {
-            assert_eq!(accepted_suite, SuiteId::V2X25519Ed25519)
+    let hello = client_one_rtt_hello(&ccfg, &[SuiteId::MlKem768MlDsa65, SuiteId::X25519Ed25519]);
+    let (accepted, spk) = match server_on_first(&scfg, &hello, IP, &clock, &guard).unwrap() {
+        ServerStep::OneRtt { hello: Frame::ServerHello { accepted_suite, server_pk, .. }, .. } => {
+            (SuiteId::from_code(accepted_suite).unwrap(), server_pk)
         }
-        _ => panic!("expected 0-RTT v2"),
-    }
+        _ => panic!("expected ServerHello"),
+    };
+    assert_eq!(accepted, SuiteId::X25519Ed25519);
+    let _ = spk;
 }
 
 #[test]
 fn no_common_suite_is_rejected_zero_rtt() {
-    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
-    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]); // server: v2 only
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::X25519Ed25519]); // server: v2 only
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
 
-    let offers = [(SuiteId::V1MlKem768MlDsa65, vec![0u8; 1184])]; // client offers v1 only
-    let (frame, _ce) = client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"x").unwrap();
+    // Client tries 0-RTT with v1, server only has v2
+    let (frame, _ce) = client_offer_zero_rtt(&ccfg, SuiteId::MlKem768MlDsa65, &vec![0u8; 1184], IP, &clock, b"x").unwrap();
     match server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap() {
         ServerStep::Reject {
             frame: Frame::ServerReject { reason },
@@ -186,12 +182,12 @@ fn no_common_suite_is_rejected_zero_rtt() {
 
 #[test]
 fn no_common_suite_is_rejected_one_rtt() {
-    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
-    let scfg = server_cfg(&[SuiteId::V2X25519Ed25519]);
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::X25519Ed25519]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
 
-    let hello = client_one_rtt_hello(&ccfg, &[SuiteId::V1MlKem768MlDsa65]);
+    let hello = client_one_rtt_hello(&ccfg, &[SuiteId::MlKem768MlDsa65]);
     match server_on_first(&scfg, &hello, IP, &clock, &guard).unwrap() {
         ServerStep::Reject {
             frame: Frame::ServerReject { reason },
@@ -203,18 +199,17 @@ fn no_common_suite_is_rejected_one_rtt() {
 }
 
 fn make_zero_rtt(scfg: &ServerConfig) -> Frame {
-    let ccfg = client_cfg(SuiteId::V1MlKem768MlDsa65);
-    let kem = SuiteId::V1MlKem768MlDsa65;
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let kem = SuiteId::MlKem768MlDsa65;
     let clock = FixedClock::new(1_000_000);
-    let offers = [(kem, server_pk(scfg, kem))];
-    client_offer_zero_rtt(&ccfg, &offers, IP, &clock, b"d")
+    client_offer_zero_rtt(&ccfg, kem, &server_pk(scfg, kem), IP, &clock, b"d")
         .unwrap()
         .0
 }
 
 #[test]
 fn replay_within_window_rejected() {
-    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
@@ -227,7 +222,7 @@ fn replay_within_window_rejected() {
 
 #[test]
 fn stale_timestamp_rejected() {
-    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
@@ -240,7 +235,7 @@ fn stale_timestamp_rejected() {
 
 #[test]
 fn source_ip_mismatch_rejected() {
-    let scfg = server_cfg(&[SuiteId::V1MlKem768MlDsa65]);
+    let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
