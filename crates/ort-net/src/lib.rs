@@ -11,7 +11,7 @@ pub mod run;
 pub mod session;
 pub mod transport;
 
-pub use cert::{ServerVerifier, SERVERPK_OID_STR, SERVERPK_OID_U64};
+pub use cert::ServerVerifier;
 pub use error::{OrtError, Result};
 pub use forward::forward;
 pub use replay::ConcurrentStrikeCache;

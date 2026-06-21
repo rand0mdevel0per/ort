@@ -26,6 +26,7 @@ fn server_cfg(suites: &[SuiteId]) -> ServerConfig {
         .map(|id| SuiteKey {
             key: ServerKemKey::generate(*id),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(*id)),
         })
         .collect();
     ServerConfig {
@@ -261,8 +262,10 @@ fn half_rtt_establishes_session() {
             let mut server_record = RecordLayer::new(server_keys, &nonce);
 
             // Client processes ServerRefuse0RTT
-            if let Frame::ServerRefuse0RTT { server_ct, nonce: n, .. } = frame {
-                client_half_rtt_finish(&mut est, &server_ct, &n).unwrap();
+            if let Frame::ServerRefuse0RTT { accepted_suite, server_ct, nonce: n, server_signature } = frame {
+                let server_vk = scfg.suites[0].cert_signing_key.as_ref().unwrap().public();
+                let sig_suite = scfg.suites[0].cert_signing_key.as_ref().unwrap().suite_id();
+                client_half_rtt_finish(&mut est, accepted_suite, &server_ct, &n, &server_signature, &server_vk, sig_suite).unwrap();
                 // Both sides now have established RecordLayers
                 exchange(&mut est.record, &mut server_record);
             } else {

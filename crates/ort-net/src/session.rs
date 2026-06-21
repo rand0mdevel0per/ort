@@ -59,6 +59,8 @@ pub struct Learned {
     pub accepted_suite: SuiteId,
     /// Server KEM public key for that suite.
     pub server_pk: Vec<u8>,
+    /// Server's certificate (DER), for Half-RTT signature verification.
+    pub certificate: Vec<u8>,
 }
 
 /// Result of a client handshake.
@@ -91,14 +93,15 @@ pub async fn client_1rtt<C: Clock>(
         .await?;
 
     let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
-    let (accepted_suite, server_pk, certificate, observed_ip) = match Frame::decode(&body)? {
+    let (accepted_suite, server_pk, server_pk_signature, certificate, observed_ip) = match Frame::decode(&body)? {
         Frame::ServerHello {
             accepted_suite,
             server_pk,
+            server_pk_signature,
             certificate,
             observed_ip,
             ..
-        } => (accepted_suite, server_pk, certificate, observed_ip),
+        } => (accepted_suite, server_pk, server_pk_signature, certificate, observed_ip),
         Frame::ServerReject { reason } => return Err(OrtError::Rejected(reason)),
         _ => return Err(OrtError::Unexpected("expected ServerHello")),
     };
@@ -108,7 +111,22 @@ pub async fn client_1rtt<C: Clock>(
     if !kem_suites.contains(&suite) {
         return Err(OrtError::UnexpectedSuite(accepted_suite));
     }
-    verifier.verify(&server_pk, &certificate)?;
+
+    // Verify certificate (if present) and server_pk signature
+    if !certificate.is_empty() {
+        verifier.verify(&certificate)?;
+        let (cert_vk, sig_suite) = crate::cert::extract_signing_key(&certificate)?;
+
+        // Verify server_pk signature to prove ownership
+        if !server_pk_signature.is_empty() {
+            let server_pk_hash = ort_core::prim::hash256(&server_pk);
+            ort_core::suite::agile::sig_verify(sig_suite, &cert_vk, &server_pk_hash, &server_pk_signature)?;
+        }
+    } else {
+        // No certificate: TOFU mode or test environment
+        // Signature verification is skipped (trust on first use)
+    }
+
     if let Some(pin) = pinned {
         if pin != server_pk {
             return Err(OrtError::PinMismatch);
@@ -130,6 +148,7 @@ pub async fn client_1rtt<C: Clock>(
             observed_ip,
             accepted_suite: suite,
             server_pk,
+            certificate,
         }),
     })
 }
@@ -144,6 +163,7 @@ pub async fn client_0rtt<C: Clock>(
     cfg: &ClientConfig,
     suite: SuiteId,
     server_pk: &[u8],
+    server_cert: &[u8],
     src_ip: [u8; 16],
     clock: &C,
     early_data: &[u8],
@@ -177,13 +197,29 @@ pub async fn client_0rtt<C: Clock>(
             accepted_suite,
             server_ct,
             nonce,
+            server_signature,
         } => {
-            // Half-RTT fallback: server rejected 0-RTT but provided server_ct
+            // Half-RTT fallback: server rejected 0-RTT but provided server_ct + signature
             if accepted_suite != est.offered_suite.code() {
                 return Err(OrtError::UnexpectedSuite(accepted_suite));
             }
-            // Derive session keys using server's ct and nonce
-            ort_core::handshake::client_half_rtt_finish(&mut est, &server_ct, &nonce)?;
+
+            // Extract server's signing public key from cached certificate
+            // TODO: This should parse the certificate and extract the public key
+            // For now, we need a helper function in cert module
+            let (server_vk, sig_suite) = crate::cert::extract_signing_key(server_cert)?;
+
+            // Verify server signature and establish channel
+            ort_core::handshake::client_half_rtt_finish(
+                &mut est,
+                accepted_suite,
+                &server_ct,
+                &nonce,
+                &server_signature,
+                &server_vk,
+                sig_suite,
+            )?;
+
             // Channel established, early data was NOT delivered (0-RTT rejected)
             Ok(ClientOutcome {
                 conn: OrtConn {

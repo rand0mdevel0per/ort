@@ -11,7 +11,7 @@ use ort_cli::{hex, init_tracing, read_key, write_key};
 use ort_core::handshake::{ServerConfig, SuiteKey};
 use ort_core::suite::agile::ServerKemKey;
 use ort_core::suite::SuiteId;
-use ort_net::{run_server, SERVERPK_OID_U64};
+use ort_net::run_server;
 use tokio::net::TcpListener;
 
 /// Suites the server can hold keys for.
@@ -118,7 +118,7 @@ fn gen_key(args: GenArgs) -> Result<()> {
 }
 
 fn gen_cert(args: GenArgs) -> Result<()> {
-    use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ED25519};
+    use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
     for id in parse_suites(&args.suite)? {
         let key = load_or_make_kem(&args.out, id)?;
         let server_pk = key.public();
@@ -135,13 +135,8 @@ fn gen_cert(args: GenArgs) -> Result<()> {
             kp
         };
 
-        let mut params = CertificateParams::new(vec!["ortd".to_string()]).context("cert params")?;
-        params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                SERVERPK_OID_U64,
-                server_pk.clone(),
-            ));
+        // Standard X.509 certificate (no custom extensions)
+        let params = CertificateParams::new(vec!["ortd".to_string()]).context("cert params")?;
         let cert = params.self_signed(&kp).context("self-sign cert")?;
         std::fs::write(args.out.join(cert_file(id)), cert.der().as_ref()).context("write cert")?;
         println!(
@@ -173,8 +168,31 @@ fn load_server_config(args: &RunArgs) -> Result<ServerConfig> {
             .transpose()
             .context("reading certificate")?
             .unwrap_or_default();
+
+        // Load certificate signing key (for Half-RTT authentication)
+        // Note: gen_cert uses Ed25519 for all suites' certificates (regardless of KEM)
+        let cert_signing_key = args
+            .cert
+            .as_ref()
+            .map(|d| d.join(cert_signing_file(id)))
+            .filter(|p| p.exists())
+            .map(|p| {
+                let der = read_key(&p)?;
+                // rcgen serializes Ed25519 keys as DER; extract the 32-byte seed
+                // DER format: SEQUENCE { version, SEQUENCE { OID }, OCTET STRING (seed) }
+                // For simplicity, assume the last 32 bytes are the seed
+                if der.len() < 32 {
+                    anyhow::bail!("cert signing key too short");
+                }
+                let seed = &der[der.len() - 32..];
+                // Certificate signing always uses Ed25519 (X25519Ed25519 suite)
+                ort_core::suite::agile::SigIdentity::from_seed(SuiteId::X25519Ed25519, seed)
+                    .context("parse cert signing key")
+            })
+            .transpose()?;
+
         tracing::info!(suite = suite_name(id), server_pk = %hex(&key.public()), "loaded suite");
-        suites.push(SuiteKey { key, certificate });
+        suites.push(SuiteKey { key, certificate, cert_signing_key });
     }
     if suites.is_empty() {
         anyhow::bail!("no server keys found in --cert dir (run `ortd gen-key` first)");

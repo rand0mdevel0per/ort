@@ -42,6 +42,7 @@ fn decode_zero_length_vec_accepted() {
     buf.extend_from_slice(&0x0001u16.to_be_bytes()); // accepted_suite
     buf.extend_from_slice(&10u32.to_be_bytes()); // server_pk len
     buf.extend(&vec![0xAB; 10]); // server_pk
+    buf.extend_from_slice(&0u32.to_be_bytes()); // server_pk_signature len = 0
     buf.extend_from_slice(&0u32.to_be_bytes()); // certificate len = 0
     buf.extend_from_slice(&[127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // observed_ip
     buf.extend_from_slice(&1000u64.to_be_bytes()); // server_ts
@@ -123,6 +124,7 @@ fn encode_decode_preserves_all_fields() {
     let frame = Frame::ServerHello {
         accepted_suite: 0x1234,
         server_pk: vec![0xAB; 1184],
+        server_pk_signature: vec![0xEF; 64],
         certificate: vec![0xCD; 700],
         observed_ip: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         server_ts: 9876543210,
@@ -133,12 +135,14 @@ fn encode_decode_preserves_all_fields() {
         Frame::ServerHello {
             accepted_suite,
             server_pk,
+            server_pk_signature,
             certificate,
             observed_ip,
             server_ts,
         } => {
             assert_eq!(accepted_suite, 0x1234);
             assert_eq!(server_pk.len(), 1184);
+            assert_eq!(server_pk_signature.len(), 64);
             assert_eq!(certificate.len(), 700);
             assert_eq!(observed_ip[0], 10);
             assert_eq!(server_ts, 9876543210);

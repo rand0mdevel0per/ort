@@ -19,6 +19,9 @@ pub struct SuiteKey {
     pub key: ServerKemKey,
     /// DER certificate binding the public key (empty if none).
     pub certificate: Vec<u8>,
+    /// Certificate private key for signing Half-RTT responses (Ed25519/ML-DSA).
+    /// Must match the certificate's public key. If empty, Half-RTT will fail.
+    pub cert_signing_key: Option<agile::SigIdentity>,
 }
 
 /// Server configuration: the suites it supports (preference order) + windows.
@@ -177,16 +180,26 @@ fn fallback_to_2rtt<C: Clock>(
         .find_map(|s| cfg.find(s));
 
     match chosen {
-        Some(suite_key) => Ok(ServerStep::OneRtt {
-            hello: Frame::ServerHello {
-                accepted_suite: suite_key.key.suite_id().code(),
-                server_pk: suite_key.key.public(),
-                certificate: suite_key.certificate.clone(),
-                observed_ip: peer_ip,
-                server_ts: clock.now_millis(),
-            },
-            selected: suite_key.key.suite_id(),
-        }),
+        Some(suite_key) => {
+            let server_pk = suite_key.key.public();
+            // Sign BLAKE3-256(server_pk) to prove ownership
+            let server_pk_hash = crate::prim::hash256(&server_pk);
+            let server_pk_signature = suite_key.cert_signing_key.as_ref()
+                .map(|sk| sk.sign(&server_pk_hash))
+                .unwrap_or_default(); // empty if no signing key
+
+            Ok(ServerStep::OneRtt {
+                hello: Frame::ServerHello {
+                    accepted_suite: suite_key.key.suite_id().code(),
+                    server_pk,
+                    server_pk_signature,
+                    certificate: suite_key.certificate.clone(),
+                    observed_ip: peer_ip,
+                    server_ts: clock.now_millis(),
+                },
+                selected: suite_key.key.suite_id(),
+            })
+        }
         None => Ok(ServerStep::Reject {
             frame: reject_frame(reject::NO_COMMON_SUITE),
         }),
@@ -208,16 +221,26 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                 .filter_map(|c| SuiteId::from_code(*c))
                 .find_map(|s| cfg.find(s));
             match chosen {
-                Some(suite_key) => Ok(ServerStep::OneRtt {
-                    hello: Frame::ServerHello {
-                        accepted_suite: suite_key.key.suite_id().code(),
-                        server_pk: suite_key.key.public(),
-                        certificate: suite_key.certificate.clone(),
-                        observed_ip: peer_ip,
-                        server_ts: clock.now_millis(),
-                    },
-                    selected: suite_key.key.suite_id(),
-                }),
+                Some(suite_key) => {
+                    let server_pk = suite_key.key.public();
+                    // Sign BLAKE3-256(server_pk) to prove ownership
+                    let server_pk_hash = crate::prim::hash256(&server_pk);
+                    let server_pk_signature = suite_key.cert_signing_key.as_ref()
+                        .map(|sk| sk.sign(&server_pk_hash))
+                        .unwrap_or_default(); // empty if no signing key
+
+                    Ok(ServerStep::OneRtt {
+                        hello: Frame::ServerHello {
+                            accepted_suite: suite_key.key.suite_id().code(),
+                            server_pk,
+                            server_pk_signature,
+                            certificate: suite_key.certificate.clone(),
+                            observed_ip: peer_ip,
+                            server_ts: clock.now_millis(),
+                        },
+                        selected: suite_key.key.suite_id(),
+                    })
+                }
                 None => Ok(ServerStep::Reject { frame: reject_frame(reject::NO_COMMON_SUITE) }),
             }
         }
@@ -249,16 +272,30 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
 
                             // Try encapsulate to client_kem_pk
                             match agile::kem_encapsulate(accepted, client_kem_pk, &r) {
-                                Ok((server_ct, shared)) => Ok(ServerStep::HalfRtt {
-                                    accepted_suite: accepted,
-                                    frame: Frame::ServerRefuse0RTT {
-                                        accepted_suite: accepted.code(),
-                                        server_ct,
+                                Ok((server_ct, shared)) => {
+                                    // Sign the Half-RTT response for MITM protection
+                                    let sig_key = suite_key.cert_signing_key.as_ref()
+                                        .ok_or(Error::UnexpectedMessage("Half-RTT requires cert_signing_key"))?;
+
+                                    // Signature over: accepted_suite || server_ct || nonce
+                                    let mut to_sign = Vec::new();
+                                    to_sign.extend_from_slice(&accepted.code().to_be_bytes());
+                                    to_sign.extend_from_slice(&server_ct);
+                                    to_sign.extend_from_slice(&nonce);
+                                    let server_signature = sig_key.sign(&to_sign);
+
+                                    Ok(ServerStep::HalfRtt {
+                                        accepted_suite: accepted,
+                                        frame: Frame::ServerRefuse0RTT {
+                                            accepted_suite: accepted.code(),
+                                            server_ct,
+                                            nonce,
+                                            server_signature,
+                                        },
+                                        shared: Zeroizing::new(shared),
                                         nonce,
-                                    },
-                                    shared: Zeroizing::new(shared),
-                                    nonce,
-                                }),
+                                    })
+                                }
                                 Err(_) => {
                                     // client_kem_pk doesn't match selected suite -> 2-RTT
                                     fallback_to_2rtt(cfg, payload, peer_ip, clock)

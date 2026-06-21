@@ -46,6 +46,7 @@ fn all_frame_variants_roundtrip() {
     roundtrip(&Frame::ServerHello {
         accepted_suite: 0x0001,
         server_pk: vec![7u8; 1184],
+        server_pk_signature: vec![6u8; 64],
         certificate: vec![8u8; 700],
         observed_ip: [9u8; 16],
         server_ts: 42,
@@ -59,6 +60,7 @@ fn all_frame_variants_roundtrip() {
         accepted_suite: 0x0001,
         server_ct: vec![0xAB; 1088],
         nonce: [0x42; 32],
+        server_signature: vec![0xCD; 64],
     });
     roundtrip(&Frame::DataRecord {
         from_server: true,
@@ -76,6 +78,7 @@ fn empty_certificate_roundtrips() {
     roundtrip(&Frame::ServerHello {
         accepted_suite: 0x0001,
         server_pk: vec![7u8; 1184],
+        server_pk_signature: vec![],
         certificate: vec![],
         observed_ip: [0u8; 16],
         server_ts: 0,

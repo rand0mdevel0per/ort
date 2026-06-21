@@ -173,7 +173,9 @@ pub enum Frame {
         accepted_suite: u16,
         /// KEM encapsulation (public) key for the accepted suite.
         server_pk: Vec<u8>,
-        /// DER certificate chain binding `server_pk` (empty if none).
+        /// Certificate signature over BLAKE3-256(server_pk) proving ownership.
+        server_pk_signature: Vec<u8>,
+        /// DER certificate chain (standard X.509, no custom extensions).
         certificate: Vec<u8>,
         /// The client source IP as observed by the server (NAT-safe ConnMeta).
         observed_ip: [u8; 16],
@@ -193,7 +195,8 @@ pub enum Frame {
         reason: u8,
     },
     /// Half-RTT fallback: 0-RTT rejected (replay/window) but channel can be
-    /// established. Server encapsulated to client's ephemeral KEM key.
+    /// established. Server encapsulated to client's ephemeral KEM key and signs
+    /// the response for authentication.
     ServerRefuse0RTT {
         /// Accepted cipher suite.
         accepted_suite: u16,
@@ -201,6 +204,8 @@ pub enum Frame {
         server_ct: Vec<u8>,
         /// Server-chosen nonce for key derivation.
         nonce: [u8; 32],
+        /// Server signature over (accepted_suite || server_ct || nonce) for MITM protection.
+        server_signature: Vec<u8>,
     },
     /// Application data record.
     DataRecord {
@@ -258,6 +263,7 @@ impl Frame {
             Frame::ServerHello {
                 accepted_suite,
                 server_pk,
+                server_pk_signature,
                 certificate,
                 observed_ip,
                 server_ts,
@@ -265,6 +271,7 @@ impl Frame {
                 w.u8(FrameType::ServerHello as u8)
                     .u16(*accepted_suite)
                     .bytes(server_pk)
+                    .bytes(server_pk_signature)
                     .bytes(certificate)
                     .raw(observed_ip)
                     .u64(*server_ts);
@@ -284,11 +291,13 @@ impl Frame {
                 accepted_suite,
                 server_ct,
                 nonce,
+                server_signature,
             } => {
                 w.u8(FrameType::ServerRefuse0RTT as u8)
                     .u16(*accepted_suite)
                     .bytes(server_ct)
-                    .raw(nonce);
+                    .raw(nonce)
+                    .bytes(server_signature);
             }
             Frame::DataRecord {
                 from_server,
@@ -344,6 +353,7 @@ impl Frame {
             FrameType::ServerHello => Frame::ServerHello {
                 accepted_suite: r.u16()?,
                 server_pk: r.bytes()?.to_vec(),
+                server_pk_signature: r.bytes()?.to_vec(),
                 certificate: r.bytes()?.to_vec(),
                 observed_ip: r.array::<16>()?,
                 server_ts: r.u64()?,
@@ -357,6 +367,7 @@ impl Frame {
                 accepted_suite: r.u16()?,
                 server_ct: r.bytes()?.to_vec(),
                 nonce: r.array::<32>()?,
+                server_signature: r.bytes()?.to_vec(),
             },
             FrameType::DataRecord => {
                 let from_server = match r.u8()? {

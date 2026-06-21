@@ -60,6 +60,7 @@ async fn boot(
         .map(|id| SuiteKey {
             key: ServerKemKey::generate(*id),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(*id)),
         })
         .collect();
     let scfg = Arc::new(ServerConfig {

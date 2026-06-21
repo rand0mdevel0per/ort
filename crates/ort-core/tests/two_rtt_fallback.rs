@@ -21,6 +21,7 @@ fn no_common_suite_falls_back_to_2rtt() {
         suites: vec![SuiteKey {
             key: ServerKemKey::generate(SuiteId::X25519Ed25519),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(SuiteId::X25519Ed25519)),
         }],
         window_ms: 2000,
         skew_ms: 1000,
@@ -29,6 +30,7 @@ fn no_common_suite_falls_back_to_2rtt() {
         suites: vec![SuiteKey {
             key: ServerKemKey::generate(SuiteId::MlKem768MlDsa65),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(SuiteId::MlKem768MlDsa65)),
         }],
         window_ms: 2000,
         skew_ms: 1000,
@@ -74,6 +76,7 @@ fn bad_signature_rejected_not_fallback() {
         suites: vec![SuiteKey {
             key: ServerKemKey::generate(SuiteId::X25519Ed25519),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(SuiteId::X25519Ed25519)),
         }],
         window_ms: 2000,
         skew_ms: 1000,
@@ -115,6 +118,7 @@ fn empty_offers_with_server_support_falls_back_to_2rtt() {
         suites: vec![SuiteKey {
             key: ServerKemKey::generate(SuiteId::MlKem768MlDsa65),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(SuiteId::MlKem768MlDsa65)),
         }],
         window_ms: 2000,
         skew_ms: 1000,

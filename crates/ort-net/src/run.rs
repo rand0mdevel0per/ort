@@ -71,7 +71,7 @@ pub struct ClientParams {
 #[derive(Default)]
 struct Cache {
     observed_ip: Option<[u8; 16]>,
-    primary: Option<(SuiteId, Vec<u8>)>,
+    primary: Option<(SuiteId, Vec<u8>, Vec<u8>)>, // (suite, server_pk, certificate)
 }
 
 /// Run the `ortc` client: accept local app connections and tunnel each to the
@@ -122,16 +122,16 @@ async fn handle_client_conn(
     } else {
         let c = cache.lock().await;
         match (c.observed_ip, &c.primary) {
-            (Some(ip), Some((suite, pk))) if params.kem_suites.contains(suite) => {
-                Some((ip, *suite, pk.clone()))
+            (Some(ip), Some((suite, pk, cert))) if params.kem_suites.contains(suite) => {
+                Some((ip, *suite, pk.clone(), cert.clone()))
             }
             _ => None,
         }
     };
 
-    if let Some((observed_ip, suite, pk)) = zero_rtt {
+    if let Some((observed_ip, suite, pk, cert)) = zero_rtt {
         let ortd = TcpStream::connect(target).await?;
-        match client_0rtt(ortd, &params.cfg, suite, &pk, observed_ip, &clock, b"").await {
+        match client_0rtt(ortd, &params.cfg, suite, &pk, &cert, observed_ip, &clock, b"").await {
             Ok(outcome) => return forward(app_sock, outcome.conn, Vec::new()).await,
             Err(e) if is_zero_rtt_fallback(&e) => {
                 tracing::debug!(error = %e, "0-RTT failed; falling back to 1-RTT");
@@ -157,7 +157,7 @@ async fn handle_client_conn(
     if let Some(learned) = &outcome.learned {
         let mut c = cache.lock().await;
         c.observed_ip = Some(learned.observed_ip);
-        c.primary = Some((learned.accepted_suite, learned.server_pk.clone()));
+        c.primary = Some((learned.accepted_suite, learned.server_pk.clone(), learned.certificate.clone()));
     }
     forward(app_sock, outcome.conn, Vec::new()).await
 }

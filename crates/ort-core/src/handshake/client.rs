@@ -141,11 +141,27 @@ pub fn client_one_rtt_finish<C: Clock>(
 
 /// Half-RTT: process ServerRefuse0RTT and establish the channel using the
 /// server's ciphertext. The server encapsulated to our ephemeral KEM key.
+///
+/// The server signature must be verified using the cached server certificate's
+/// public key (extracted by ort-net layer). This prevents MITM attacks.
 pub fn client_half_rtt_finish(
     est: &mut ClientEstablished,
+    accepted_suite: u16,
     server_ct: &[u8],
     nonce: &[u8; 32],
+    server_signature: &[u8],
+    server_vk: &[u8],
+    sig_suite: SuiteId,
 ) -> Result<()> {
+    // Verify server signature over (accepted_suite || server_ct || nonce)
+    let mut to_verify = Vec::new();
+    to_verify.extend_from_slice(&accepted_suite.to_be_bytes());
+    to_verify.extend_from_slice(server_ct);
+    to_verify.extend_from_slice(nonce);
+
+    agile::sig_verify(sig_suite, server_vk, &to_verify, server_signature)?;
+
+    // Signature verified, now establish channel
     let temp_kem = est.temp_kem_secret.take().ok_or(Error::UnexpectedMessage("no temp KEM secret"))?;
     let shared = Zeroizing::new(temp_kem.decapsulate(server_ct)?);
     let keys = derive_session_keys(&shared, nonce);

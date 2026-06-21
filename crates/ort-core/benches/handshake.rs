@@ -23,6 +23,7 @@ fn server_cfg(suites: &[SuiteId]) -> ServerConfig {
         .map(|id| SuiteKey {
             key: ServerKemKey::generate(*id),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(*id)),
         })
         .collect();
     ServerConfig {
@@ -99,10 +100,16 @@ fn bench_half_rtt(c: &mut Criterion) {
                 let step = server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap();
                 if let ServerStep::HalfRtt { frame, .. } = step {
                     if let Frame::ServerRefuse0RTT {
-                        server_ct, nonce, ..
+                        accepted_suite: suite_code,
+                        server_ct,
+                        nonce,
+                        server_signature,
                     } = frame
                     {
-                        client_half_rtt_finish(&mut est, &server_ct, &nonce).unwrap();
+                        // Extract server vk from the suite_key (in real usage, from cached cert)
+                        let server_vk = scfg.suites[0].cert_signing_key.as_ref().unwrap().public();
+                        let sig_suite = scfg.suites[0].cert_signing_key.as_ref().unwrap().suite_id();
+                        client_half_rtt_finish(&mut est, suite_code, &server_ct, &nonce, &server_signature, &server_vk, sig_suite).unwrap();
                     }
                 }
                 black_box(est);

@@ -23,6 +23,7 @@ fn server_cfg() -> ServerConfig {
         suites: vec![SuiteKey {
             key: ServerKemKey::generate(SuiteId::MlKem768MlDsa65),
             certificate: vec![],
+            cert_signing_key: Some(SigIdentity::generate(SuiteId::MlKem768MlDsa65)),
         }],
         window_ms: 2000,
         skew_ms: 1000,
