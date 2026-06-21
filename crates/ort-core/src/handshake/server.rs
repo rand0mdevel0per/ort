@@ -106,11 +106,10 @@ fn select_offered<'a>(
 }
 
 /// Validate and process a client KEM payload. Order is fail-fast/DoS-aware:
-/// cheap public checks and suite selection first (so unsupported-suite spam is
-/// rejected without expensive signature work), then the client signature, then
-/// the replay guard, then the KEM/AEAD work.
-///
-/// For Half-RTT support, also accepts `client_kem_pk` for fallback encapsulation.
+/// 1. Suite selection (cheap, reject unsupported suites before expensive work)
+/// 2. Signature verification (authenticates client identity - MUST come first)
+/// 3. Post-authentication checks: timestamp, source IP, replay guard
+/// 4. KEM/AEAD work
 fn process_payload<C: Clock, G: ReplayGuard>(
     cfg: &ServerConfig,
     client_pk: &[u8],
@@ -125,17 +124,11 @@ fn process_payload<C: Clock, G: ReplayGuard>(
     let now = clock.now_millis();
     let sig_alg = suite_from_code(sig_alg_code)?;
 
-    // (a) source IP binding
-    if payload.src_ip != peer_ip {
-        return Err(Error::SourceIpMismatch);
-    }
-    // (b) timestamp window
-    check_window(now, payload.ts_millis, cfg.window_ms, cfg.skew_ms)?;
-    // (c) select a mutually-supported suite *before* the expensive signature
+    // (a) suite selection (cheap, reject unsupported suites before expensive signature work)
     let (offer, suite_key) = select_offered(cfg, payload, expected).ok_or(Error::NoCommonSuite)?;
     let accepted = suite_key.key.suite_id();
 
-    // (d) client binding signature (authenticates public key hashes + offers)
+    // (b) client binding signature (authenticates client identity - MUST come before other checks)
     let sig_pk_hash = crate::prim::hash256(client_pk);
     let kem_pk_hash = crate::prim::hash256(client_kem_pk.unwrap_or(&[]));
     let cm = ConnMeta {
@@ -146,6 +139,14 @@ fn process_payload<C: Clock, G: ReplayGuard>(
     };
     let oh = offers_hash(&payload.offers);
     verify_client_binding(sig_alg, client_pk, &cm, &oh, &payload.client_sig)?;
+
+    // (c) timestamp window check (post-authentication)
+    check_window(now, payload.ts_millis, cfg.window_ms, cfg.skew_ms)?;
+
+    // (d) source IP binding (post-authentication check)
+    if payload.src_ip != peer_ip {
+        return Err(Error::SourceIpMismatch);
+    }
 
     // (e) replay strike guard (authenticated payloads only)
     guard.check_and_insert(cm.replay_tag(&offer.nonce), now)?;
@@ -236,19 +237,17 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                     },
                     established,
                 }),
-                Err(Error::Replayed) | Err(Error::StaleTimestamp)
-                | Err(Error::BadSignature) | Err(Error::SourceIpMismatch) => {
-                    // Half-RTT or 2-RTT fallback based on suite availability
+                Err(Error::Replayed) | Err(Error::StaleTimestamp) | Err(Error::SourceIpMismatch) => {
+                    // Half-RTT: authentication succeeded, but post-auth checks failed
+                    // Safe to establish with fresh nonce since client identity is verified
                     match select_offered(cfg, payload, None) {
-                        Some((offer, suite_key)) => {
-                            // Half-RTT: we have a common suite from offers
-                            // Encapsulate to client_kem_pk (must match selected suite)
+                        Some((_offer, suite_key)) => {
                             let accepted = suite_key.key.suite_id();
                             let mut nonce = [0u8; 32];
                             crate::suite::fill_random(&mut nonce)?;
-                            let r = crate::suite::fresh_r()?;
+                            let r = Zeroizing::new(crate::suite::fresh_r()?);
 
-                            // Try encapsulate; if client_kem_pk doesn't match suite, fall back to 2-RTT
+                            // Try encapsulate to client_kem_pk
                             match agile::kem_encapsulate(accepted, client_kem_pk, &r) {
                                 Ok((server_ct, shared)) => Ok(ServerStep::HalfRtt {
                                     accepted_suite: accepted,
@@ -267,10 +266,14 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                             }
                         }
                         None => {
-                            // 2-RTT: no common suite in offers, try all available
+                            // No common suite -> 2-RTT
                             fallback_to_2rtt(cfg, payload, peer_ip, clock)
                         }
                     }
+                }
+                Err(Error::BadSignature) => {
+                    // Authentication failure: MUST NOT establish connection
+                    Err(Error::BadSignature)
                 }
                 Err(Error::NoCommonSuite) => {
                     // 2-RTT: 0-RTT suite negotiation failed, try 1-RTT

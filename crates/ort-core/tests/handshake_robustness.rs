@@ -105,7 +105,7 @@ fn source_ip_mismatch_triggers_half_rtt() {
 }
 
 #[test]
-fn tampered_signature_triggers_half_rtt() {
+fn tampered_signature_rejected() {
     let ccfg = client_cfg();
     let scfg = server_cfg();
     let spk = scfg.suites[0].key.public();
@@ -143,10 +143,10 @@ fn tampered_signature_triggers_half_rtt() {
         _ => panic!("expected ClientHelloZeroRtt"),
     };
 
-    // BadSignature now triggers Half-RTT fallback
+    // BadSignature MUST be rejected (auth bypass risk)
     assert!(matches!(
         server_on_first(&scfg, &tampered, IP, &clock, &guard),
-        Ok(ort_core::handshake::ServerStep::HalfRtt { .. })
+        Err(Error::BadSignature)
     ));
 }
 
