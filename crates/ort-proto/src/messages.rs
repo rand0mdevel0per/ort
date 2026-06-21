@@ -34,6 +34,8 @@ pub enum FrameType {
     ServerAck = 0x05,
     /// Server refusal (e.g. no common suite, bad handshake).
     ServerReject = 0x06,
+    /// Server Half-RTT fallback: 0-RTT rejected but channel can be established.
+    ServerRefuse0RTT = 0x09,
     /// An AEAD-protected application data record.
     DataRecord = 0x07,
     /// Orderly shutdown.
@@ -51,6 +53,7 @@ impl FrameType {
             0x06 => FrameType::ServerReject,
             0x07 => FrameType::DataRecord,
             0x08 => FrameType::Close,
+            0x09 => FrameType::ServerRefuse0RTT,
             other => return Err(ProtoError::UnknownFrameType(other)),
         })
     }
@@ -144,8 +147,10 @@ pub enum Frame {
     },
     /// 0-RTT ClientHello: client key + multi-suite KEM payload.
     ClientHelloZeroRtt {
-        /// Client verifying key.
+        /// Client verifying key (for signatures).
         client_pk: Vec<u8>,
+        /// Ephemeral KEM public key (for Half-RTT fallback).
+        client_kem_pk: Vec<u8>,
         /// Signature algorithm (suite id) for `client_pk`/`client_sig`.
         sig_alg: u16,
         /// Multi-suite offers + early data.
@@ -185,6 +190,16 @@ pub enum Frame {
         /// Reason code.
         reason: u8,
     },
+    /// Half-RTT fallback: 0-RTT rejected (replay/window) but channel can be
+    /// established. Server encapsulated to client's ephemeral KEM key.
+    ServerRefuse0RTT {
+        /// Accepted cipher suite.
+        accepted_suite: u16,
+        /// Server's KEM ciphertext (encapsulation to client_kem_pk).
+        server_ct: Vec<u8>,
+        /// Server-chosen nonce for key derivation.
+        nonce: [u8; 32],
+    },
     /// Application data record.
     DataRecord {
         /// `true` if sent by the server (s→c), `false` if by the client (c→s).
@@ -217,11 +232,13 @@ impl Frame {
             }
             Frame::ClientHelloZeroRtt {
                 client_pk,
+                client_kem_pk,
                 sig_alg,
                 payload,
             } => {
                 w.u8(FrameType::ClientHelloZeroRtt as u8)
                     .bytes(client_pk)
+                    .bytes(client_kem_pk)
                     .u16(*sig_alg);
                 payload.write(&mut w);
             }
@@ -259,6 +276,16 @@ impl Frame {
             }
             Frame::ServerReject { reason } => {
                 w.u8(FrameType::ServerReject as u8).u8(*reason);
+            }
+            Frame::ServerRefuse0RTT {
+                accepted_suite,
+                server_ct,
+                nonce,
+            } => {
+                w.u8(FrameType::ServerRefuse0RTT as u8)
+                    .u16(*accepted_suite)
+                    .bytes(server_ct)
+                    .raw(nonce);
             }
             Frame::DataRecord {
                 from_server,
@@ -302,6 +329,7 @@ impl Frame {
             }
             FrameType::ClientHelloZeroRtt => Frame::ClientHelloZeroRtt {
                 client_pk: r.bytes()?.to_vec(),
+                client_kem_pk: r.bytes()?.to_vec(),
                 sig_alg: r.u16()?,
                 payload: KemPayload::read(&mut r)?,
             },
@@ -322,6 +350,11 @@ impl Frame {
                 ek_hash: r.array::<EK_HASH_LEN>()?,
             },
             FrameType::ServerReject => Frame::ServerReject { reason: r.u8()? },
+            FrameType::ServerRefuse0RTT => Frame::ServerRefuse0RTT {
+                accepted_suite: r.u16()?,
+                server_ct: r.bytes()?.to_vec(),
+                nonce: r.array::<32>()?,
+            },
             FrameType::DataRecord => {
                 let from_server = match r.u8()? {
                     0 => false,

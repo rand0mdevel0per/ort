@@ -2,9 +2,10 @@
 //! multi-suite offers, negotiation/reject, and replay/window/source-IP paths.
 
 use ort_core::handshake::{
-    client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello, server_on_client_data,
-    server_on_first, ClientConfig, ServerConfig, ServerStep, SuiteKey,
+    client_half_rtt_finish, client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello,
+    server_on_client_data, server_on_first, ClientConfig, ServerConfig, ServerStep, SuiteKey,
 };
+use ort_core::kdf::derive_session_keys;
 use ort_core::pool::Direction;
 use ort_core::record::RecordLayer;
 use ort_core::replay::StrikeCache;
@@ -208,40 +209,80 @@ fn make_zero_rtt(scfg: &ServerConfig) -> Frame {
 }
 
 #[test]
-fn replay_within_window_rejected() {
+fn replay_within_window_triggers_half_rtt() {
     let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
     server_on_first(&scfg, &frame, IP, &clock, &guard).expect("first ok");
+    // Replay triggers Half-RTT fallback
     assert!(matches!(
         server_on_first(&scfg, &frame, IP, &clock, &guard),
-        Err(ort_core::Error::Replayed)
+        Ok(ServerStep::HalfRtt { .. })
     ));
 }
 
 #[test]
-fn stale_timestamp_rejected() {
+fn stale_timestamp_triggers_half_rtt() {
     let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
     clock.advance(5000);
+    // Stale timestamp triggers Half-RTT fallback
     assert!(matches!(
         server_on_first(&scfg, &frame, IP, &clock, &guard),
-        Err(ort_core::Error::StaleTimestamp)
+        Ok(ServerStep::HalfRtt { .. })
     ));
 }
 
 #[test]
-fn source_ip_mismatch_rejected() {
+fn half_rtt_establishes_session() {
+    // End-to-end Half-RTT: client attempts 0-RTT twice with same frame (replay),
+    // both successfully establish the session via Half-RTT fallback.
+    let ccfg = client_cfg(SuiteId::MlKem768MlDsa65);
+    let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
+    let kem = SuiteId::MlKem768MlDsa65;
+    let clock = FixedClock::new(1_000_000);
+    let guard = StrikeCache::new(2000);
+
+    // Create 0-RTT frame once
+    let (frame, mut est) = client_offer_zero_rtt(&ccfg, kem, &server_pk(&scfg, kem), IP, &clock, b"data").unwrap();
+
+    // First attempt: 0-RTT succeeds
+    server_on_first(&scfg, &frame, IP, &clock, &guard).expect("first 0-RTT ok");
+
+    // Second attempt with SAME frame: triggers replay → Half-RTT
+    let step = server_on_first(&scfg, &frame, IP, &clock, &guard).unwrap();
+    match step {
+        ServerStep::HalfRtt { shared, nonce, frame, .. } => {
+            // Server has keys
+            let server_keys = derive_session_keys(&shared, &nonce);
+            let mut server_record = RecordLayer::new(server_keys, &nonce);
+
+            // Client processes ServerRefuse0RTT
+            if let Frame::ServerRefuse0RTT { server_ct, nonce: n, .. } = frame {
+                client_half_rtt_finish(&mut est, &server_ct, &n).unwrap();
+                // Both sides now have established RecordLayers
+                exchange(&mut est.record, &mut server_record);
+            } else {
+                panic!("expected ServerRefuse0RTT frame");
+            }
+        }
+        _ => panic!("expected Half-RTT"),
+    }
+}
+
+#[test]
+fn source_ip_mismatch_triggers_half_rtt() {
     let scfg = server_cfg(&[SuiteId::MlKem768MlDsa65]);
     let clock = FixedClock::new(1_000_000);
     let guard = StrikeCache::new(2000);
     let frame = make_zero_rtt(&scfg);
     let other = [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // SourceIpMismatch now triggers Half-RTT fallback (not direct rejection)
     assert!(matches!(
         server_on_first(&scfg, &frame, other, &clock, &guard),
-        Err(ort_core::Error::SourceIpMismatch)
+        Ok(ServerStep::HalfRtt { .. })
     ));
 }

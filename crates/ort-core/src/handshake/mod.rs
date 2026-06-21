@@ -11,8 +11,8 @@ mod client;
 mod server;
 
 pub use client::{
-    client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello, ClientConfig,
-    ClientEstablished,
+    client_half_rtt_finish, client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello,
+    ClientConfig, ClientEstablished,
 };
 pub use server::{
     server_on_client_data, server_on_first, ServerConfig, ServerEstablished, ServerStep, SuiteKey,

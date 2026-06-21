@@ -34,6 +34,7 @@ fn all_frame_variants_roundtrip() {
     });
     roundtrip(&Frame::ClientHelloZeroRtt {
         client_pk: vec![9u8; 1952],
+        client_kem_pk: vec![7u8; 1184],
         sig_alg: 0x0001,
         payload: sample_payload(2),
     });
@@ -54,6 +55,11 @@ fn all_frame_variants_roundtrip() {
         ek_hash: [1u8; 64],
     });
     roundtrip(&Frame::ServerReject { reason: 1 });
+    roundtrip(&Frame::ServerRefuse0RTT {
+        accepted_suite: 0x0001,
+        server_ct: vec![0xAB; 1088],
+        nonce: [0x42; 32],
+    });
     roundtrip(&Frame::DataRecord {
         from_server: true,
         ciphertext: vec![0xAB; 16384],
@@ -90,9 +96,11 @@ fn invalid_data_record_dir_rejected() {
 #[test]
 fn zero_offers_rejected() {
     // ClientHelloZeroRtt with zero offers must fail.
-    let mut body = vec![0x02u8];
-    body.extend_from_slice(&1u32.to_be_bytes());
-    body.push(0xAA); // client_pk len=1
+    let mut body = vec![0x02u8]; // ClientHelloZeroRtt tag
+    body.extend_from_slice(&1u32.to_be_bytes()); // client_pk len=1
+    body.push(0xAA);
+    body.extend_from_slice(&1u32.to_be_bytes()); // client_kem_pk len=1
+    body.push(0xBB);
     body.extend_from_slice(&0x0001u16.to_be_bytes()); // sig_alg
     body.extend_from_slice(&0u16.to_be_bytes()); // 0 offers
     assert!(matches!(Frame::decode(&body), Err(ProtoError::Empty(_))));

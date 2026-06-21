@@ -8,7 +8,7 @@ use crate::record::RecordLayer;
 use crate::suite::agile::{self, SigIdentity};
 use crate::suite::{fresh_r, SuiteId};
 use crate::time::Clock;
-use crate::Result;
+use crate::{Error, Result};
 use ort_proto::{Frame, KemPayload, SuiteOffer};
 use zeroize::Zeroizing;
 
@@ -36,11 +36,15 @@ pub struct ClientEstablished {
     pub expected_ek_hash: [u8; 64],
     /// The suite that was offered (to check the server's accepted suite).
     pub offered_suite: SuiteId,
+    /// Ephemeral KEM secret for Half-RTT fallback (0-RTT only).
+    pub temp_kem_secret: Option<agile::ServerKemKey>,
 }
 
 /// Build a single self-contained offer + the record layer. Each connection
 /// derives its session keys directly from the KEM shared secret and a fresh
 /// nonce, so each suite's keys are cryptographically independent.
+///
+/// For 0-RTT, also generates an ephemeral KEM keypair for Half-RTT fallback.
 fn build_payload<C: Clock>(
     cfg: &ClientConfig,
     suite: SuiteId,
@@ -48,7 +52,8 @@ fn build_payload<C: Clock>(
     src_ip: [u8; 16],
     clock: &C,
     early_data: &[u8],
-) -> Result<(KemPayload, ClientEstablished)> {
+    is_zero_rtt: bool,
+) -> Result<(KemPayload, Vec<u8>, Option<agile::ServerKemKey>, ClientEstablished)> {
     let mut nonce = [0u8; 32];
     crate::suite::fill_random(&mut nonce)?;
 
@@ -67,11 +72,23 @@ fn build_payload<C: Clock>(
     let offers = vec![offer];
     let oh = offers_hash(&offers);
 
-    let cm = ConnMeta { src_ip, ts_millis: clock.now_millis() };
-    let client_sig = sign_client_binding(&cfg.sig, &cm, &cfg.client_pk, &oh);
+    // For 0-RTT: generate ephemeral KEM keypair for Half-RTT fallback
+    let (temp_kem_secret, client_kem_pk) = if is_zero_rtt {
+        let temp = agile::ServerKemKey::generate(suite);
+        let pk = temp.public();
+        (Some(temp), pk)
+    } else {
+        (None, Vec::new())
+    };
+
+    let sig_pk_hash = crate::prim::hash256(&cfg.client_pk);
+    let kem_pk_hash = crate::prim::hash256(&client_kem_pk);
+
+    let cm = ConnMeta { src_ip, ts_millis: clock.now_millis(), sig_pk_hash, kem_pk_hash };
+    let client_sig = sign_client_binding(&cfg.sig, &cm, &oh);
 
     let payload = KemPayload { offers, src_ip: cm.src_ip, ts_millis: cm.ts_millis, client_sig };
-    Ok((payload, ClientEstablished { record, expected_ek_hash, offered_suite: suite }))
+    Ok((payload, client_kem_pk, temp_kem_secret, ClientEstablished { record, expected_ek_hash, offered_suite: suite, temp_kem_secret: None }))
 }
 
 /// 1-RTT step 1: advertise supported KEM suites + the signature algorithm.
@@ -92,9 +109,11 @@ pub fn client_offer_zero_rtt<C: Clock>(
     clock: &C,
     early_data: &[u8],
 ) -> Result<(Frame, ClientEstablished)> {
-    let (payload, est) = build_payload(cfg, suite, server_pk, src_ip, clock, early_data)?;
+    let (payload, client_kem_pk, temp_kem_secret, mut est) = build_payload(cfg, suite, server_pk, src_ip, clock, early_data, true)?;
+    est.temp_kem_secret = temp_kem_secret;
     let frame = Frame::ClientHelloZeroRtt {
         client_pk: cfg.client_pk.clone(),
+        client_kem_pk,
         sig_alg: cfg.sig.suite_id().code(),
         payload,
     };
@@ -111,11 +130,26 @@ pub fn client_one_rtt_finish<C: Clock>(
     clock: &C,
     early_data: &[u8],
 ) -> Result<(Frame, ClientEstablished)> {
-    let (payload, est) = build_payload(cfg, accepted_suite, server_pk, src_ip, clock, early_data)?;
+    let (payload, _client_kem_pk, _temp_kem_secret, est) = build_payload(cfg, accepted_suite, server_pk, src_ip, clock, early_data, false)?;
     let frame = Frame::ClientData {
         client_pk: cfg.client_pk.clone(),
         sig_alg: cfg.sig.suite_id().code(),
         payload,
     };
     Ok((frame, est))
+}
+
+/// Half-RTT: process ServerRefuse0RTT and establish the channel using the
+/// server's ciphertext. The server encapsulated to our ephemeral KEM key.
+pub fn client_half_rtt_finish(
+    est: &mut ClientEstablished,
+    server_ct: &[u8],
+    nonce: &[u8; 32],
+) -> Result<()> {
+    let temp_kem = est.temp_kem_secret.as_ref().ok_or(Error::UnexpectedMessage("no temp KEM secret"))?;
+    let shared = Zeroizing::new(temp_kem.decapsulate(server_ct)?);
+    let keys = derive_session_keys(&shared, nonce);
+    est.record = RecordLayer::new(keys, nonce);
+    est.expected_ek_hash = est.record.enc_key_hash();
+    Ok(())
 }

@@ -6,7 +6,7 @@ use crate::kdf::derive_session_keys;
 use crate::pool::Direction;
 use crate::record::RecordLayer;
 use crate::replay::ReplayGuard;
-use crate::suite::agile::{suite_from_code, ServerKemKey};
+use crate::suite::agile::{self, suite_from_code, ServerKemKey};
 use crate::suite::SuiteId;
 use crate::time::{check_window, Clock};
 use crate::{Error, Result};
@@ -57,6 +57,18 @@ pub enum ServerStep {
         /// Established session.
         established: ServerEstablished,
     },
+    /// Half-RTT fallback: 0-RTT rejected (replay/window) but channel can be
+    /// established. Send `frame`, then derive RecordLayer and await data records.
+    HalfRtt {
+        /// Accepted suite.
+        accepted_suite: SuiteId,
+        /// ServerRefuse0RTT frame.
+        frame: Frame,
+        /// Shared secret and nonce for deriving the session keys.
+        shared: zeroize::Zeroizing<[u8; 32]>,
+        /// Nonce used for key derivation.
+        nonce: [u8; 32],
+    },
     /// 1-RTT: send `hello`, await ClientData for `selected`.
     OneRtt {
         /// ServerHello frame.
@@ -97,9 +109,12 @@ fn select_offered<'a>(
 /// cheap public checks and suite selection first (so unsupported-suite spam is
 /// rejected without expensive signature work), then the client signature, then
 /// the replay guard, then the KEM/AEAD work.
+///
+/// For Half-RTT support, also accepts `client_kem_pk` for fallback encapsulation.
 fn process_payload<C: Clock, G: ReplayGuard>(
     cfg: &ServerConfig,
     client_pk: &[u8],
+    client_kem_pk: Option<&[u8]>,
     sig_alg_code: u16,
     payload: &KemPayload,
     peer_ip: [u8; 16],
@@ -119,12 +134,22 @@ fn process_payload<C: Clock, G: ReplayGuard>(
     // (c) select a mutually-supported suite *before* the expensive signature
     let (offer, suite_key) = select_offered(cfg, payload, expected).ok_or(Error::NoCommonSuite)?;
     let accepted = suite_key.key.suite_id();
-    // (d) client binding signature (authenticates all offers + version + sig_alg)
-    let cm = ConnMeta { src_ip: payload.src_ip, ts_millis: payload.ts_millis };
+
+    // (d) client binding signature (authenticates public key hashes + offers)
+    let sig_pk_hash = crate::prim::hash256(client_pk);
+    let kem_pk_hash = crate::prim::hash256(client_kem_pk.unwrap_or(&[]));
+    let cm = ConnMeta {
+        src_ip: payload.src_ip,
+        ts_millis: payload.ts_millis,
+        sig_pk_hash,
+        kem_pk_hash
+    };
     let oh = offers_hash(&payload.offers);
     verify_client_binding(sig_alg, client_pk, &cm, &oh, &payload.client_sig)?;
+
     // (e) replay strike guard (authenticated payloads only)
     guard.check_and_insert(cm.replay_tag(&offer.nonce), now)?;
+
     // (f) decapsulate, derive keys from shared secret, open early data
     let shared = Zeroizing::new(suite_key.key.decapsulate(&offer.ciphertext)?);
     let keys = derive_session_keys(&shared, &offer.nonce);
@@ -136,6 +161,35 @@ fn process_payload<C: Clock, G: ReplayGuard>(
 
 fn reject_frame(reason: u8) -> Frame {
     Frame::ServerReject { reason }
+}
+
+/// Attempt 2-RTT fallback: pick first server-supported suite from client's offers.
+fn fallback_to_2rtt<C: Clock>(
+    cfg: &ServerConfig,
+    payload: &ort_proto::KemPayload,
+    peer_ip: [u8; 16],
+    clock: &C,
+) -> Result<ServerStep> {
+    let available: Vec<u16> = payload.offers.iter().map(|o| o.suite_id).collect();
+    let chosen = available.iter()
+        .filter_map(|c| SuiteId::from_code(*c))
+        .find_map(|s| cfg.find(s));
+
+    match chosen {
+        Some(suite_key) => Ok(ServerStep::OneRtt {
+            hello: Frame::ServerHello {
+                accepted_suite: suite_key.key.suite_id().code(),
+                server_pk: suite_key.key.public(),
+                certificate: suite_key.certificate.clone(),
+                observed_ip: peer_ip,
+                server_ts: clock.now_millis(),
+            },
+            selected: suite_key.key.suite_id(),
+        }),
+        None => Ok(ServerStep::Reject {
+            frame: reject_frame(reject::NO_COMMON_SUITE),
+        }),
+    }
 }
 
 /// Process the client's first frame.
@@ -166,8 +220,14 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                 None => Ok(ServerStep::Reject { frame: reject_frame(reject::NO_COMMON_SUITE) }),
             }
         }
-        Frame::ClientHelloZeroRtt { client_pk, sig_alg, payload } => {
-            match process_payload(cfg, client_pk, *sig_alg, payload, peer_ip, clock, guard, None) {
+        Frame::ClientHelloZeroRtt {
+            client_pk,
+            client_kem_pk,
+            sig_alg,
+            payload,
+        } => {
+            // Try 0-RTT first
+            match process_payload(cfg, client_pk, Some(client_kem_pk), *sig_alg, payload, peer_ip, clock, guard, None) {
                 Ok((accepted_suite, established)) => Ok(ServerStep::ZeroRtt {
                     accepted_suite,
                     ack: Frame::ServerAck {
@@ -176,8 +236,45 @@ pub fn server_on_first<C: Clock, G: ReplayGuard>(
                     },
                     established,
                 }),
+                Err(Error::Replayed) | Err(Error::StaleTimestamp)
+                | Err(Error::BadSignature) | Err(Error::SourceIpMismatch) => {
+                    // Half-RTT or 2-RTT fallback based on suite availability
+                    match select_offered(cfg, payload, None) {
+                        Some((offer, suite_key)) => {
+                            // Half-RTT: we have a common suite from offers
+                            // Encapsulate to client_kem_pk (must match selected suite)
+                            let accepted = suite_key.key.suite_id();
+                            let mut nonce = [0u8; 32];
+                            crate::suite::fill_random(&mut nonce)?;
+                            let r = crate::suite::fresh_r()?;
+
+                            // Try encapsulate; if client_kem_pk doesn't match suite, fall back to 2-RTT
+                            match agile::kem_encapsulate(accepted, client_kem_pk, &r) {
+                                Ok((server_ct, shared)) => Ok(ServerStep::HalfRtt {
+                                    accepted_suite: accepted,
+                                    frame: Frame::ServerRefuse0RTT {
+                                        accepted_suite: accepted.code(),
+                                        server_ct,
+                                        nonce,
+                                    },
+                                    shared: Zeroizing::new(shared),
+                                    nonce,
+                                }),
+                                Err(_) => {
+                                    // client_kem_pk doesn't match selected suite -> 2-RTT
+                                    fallback_to_2rtt(cfg, payload, peer_ip, clock)
+                                }
+                            }
+                        }
+                        None => {
+                            // 2-RTT: no common suite in offers, try all available
+                            fallback_to_2rtt(cfg, payload, peer_ip, clock)
+                        }
+                    }
+                }
                 Err(Error::NoCommonSuite) => {
-                    Ok(ServerStep::Reject { frame: reject_frame(reject::NO_COMMON_SUITE) })
+                    // 2-RTT: 0-RTT suite negotiation failed, try 1-RTT
+                    fallback_to_2rtt(cfg, payload, peer_ip, clock)
                 }
                 Err(e) => Err(e),
             }
@@ -201,6 +298,7 @@ pub fn server_on_client_data<C: Clock, G: ReplayGuard>(
             let (_suite, established) = process_payload(
                 cfg,
                 client_pk,
+                None,
                 *sig_alg,
                 payload,
                 peer_ip,

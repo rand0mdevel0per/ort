@@ -10,6 +10,8 @@ fn meta(ts: u64) -> ConnMeta {
     ConnMeta {
         src_ip: [0; 16],
         ts_millis: ts,
+        sig_pk_hash: [0xAA; 32],
+        kem_pk_hash: [0xBB; 32],
     }
 }
 
@@ -20,7 +22,7 @@ fn binding_sign_verify_both_suites() {
         let client_pk = identity.public();
         let cm = meta(1000);
         let oh = [9u8; 32];
-        let sig = sign_client_binding(&identity, &cm, &client_pk, &oh);
+        let sig = sign_client_binding(&identity, &cm, &oh);
         verify_client_binding(id, &client_pk, &cm, &oh, &sig).unwrap();
         // tampered offers hash fails
         assert!(verify_client_binding(id, &client_pk, &cm, &[8u8; 32], &sig).is_err());
@@ -53,12 +55,22 @@ fn strike_cache_dedups_and_evicts() {
 fn strike_cache_stays_bounded() {
     let cache = StrikeCache::new(2000);
     for i in 0..1000u32 {
-        let cm = ConnMeta { src_ip: [0; 16], ts_millis: i as u64 };
+        let cm = ConnMeta {
+            src_ip: [0; 16],
+            ts_millis: i as u64,
+            sig_pk_hash: [0xAA; 32],
+            kem_pk_hash: [0xBB; 32],
+        };
         let nonce = [i as u8; 32];
         cache.check_and_insert(cm.replay_tag(&nonce), 0).unwrap();
     }
     assert_eq!(cache.len(), 1000);
-    let cm = ConnMeta { src_ip: [9; 16], ts_millis: 5000 };
+    let cm = ConnMeta {
+        src_ip: [9; 16],
+        ts_millis: 5000,
+        sig_pk_hash: [0xCC; 32],
+        kem_pk_hash: [0xDD; 32],
+    };
     cache.check_and_insert(cm.replay_tag(&[0xFF; 32]), 5000).unwrap();
     assert_eq!(cache.len(), 1);
 }

@@ -149,10 +149,10 @@ pub async fn client_0rtt<C: Clock>(
     early_data: &[u8],
 ) -> Result<ClientOutcome> {
     let (mut reader, mut writer) = split(stream);
-    let (frame, est) = client_offer_zero_rtt(cfg, suite, server_pk, src_ip, clock, early_data)?;
+    let (frame, mut est) = client_offer_zero_rtt(cfg, suite, server_pk, src_ip, clock, early_data)?;
     writer.write_frame(&frame.encode()).await?;
 
-    // Confirm the ServerAck before handing the connection to the forwarder.
+    // Await server response: ServerAck (0-RTT) or ServerRefuse0RTT (Half-RTT)
     let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
     match Frame::decode(&body)? {
         Frame::ServerAck { accepted_suite, ek_hash } => {
@@ -162,20 +162,42 @@ pub async fn client_0rtt<C: Clock>(
             if ek_hash != est.expected_ek_hash {
                 return Err(OrtError::KeyConfirmation);
             }
+            // 0-RTT success
+            Ok(ClientOutcome {
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: est.record,
+                    role: Role::Client,
+                },
+                learned: None,
+            })
         }
-        Frame::ServerReject { reason } => return Err(OrtError::Rejected(reason)),
-        _ => return Err(OrtError::Unexpected("expected ServerAck")),
+        Frame::ServerRefuse0RTT {
+            accepted_suite,
+            server_ct,
+            nonce,
+        } => {
+            // Half-RTT fallback: server rejected 0-RTT but provided server_ct
+            if accepted_suite != est.offered_suite.code() {
+                return Err(OrtError::UnexpectedSuite(accepted_suite));
+            }
+            // Derive session keys using server's ct and nonce
+            ort_core::handshake::client_half_rtt_finish(&mut est, &server_ct, &nonce)?;
+            // Channel established, early data was NOT delivered (0-RTT rejected)
+            Ok(ClientOutcome {
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: est.record,
+                    role: Role::Client,
+                },
+                learned: None,
+            })
+        }
+        Frame::ServerReject { reason } => Err(OrtError::Rejected(reason)),
+        _ => Err(OrtError::Unexpected("expected ServerAck or ServerRefuse0RTT")),
     }
-
-    Ok(ClientOutcome {
-        conn: OrtConn {
-            reader,
-            writer,
-            record: est.record,
-            role: Role::Client,
-        },
-        learned: None,
-    })
 }
 
 /// Result of a server handshake.
@@ -214,6 +236,31 @@ pub async fn server_accept<C: Clock, G: ReplayGuard>(
                     role: Role::Server,
                 },
                 early_data: established.early_data,
+            })
+        }
+        ServerStep::HalfRtt {
+            accepted_suite: _,
+            frame,
+            shared,
+            nonce,
+        } => {
+            // Send ServerRefuse0RTT to client
+            writer.write_frame(&frame.encode()).await?;
+
+            // Derive session keys from the shared secret and nonce
+            let keys = ort_core::kdf::derive_session_keys(&shared, &nonce);
+            let record = ort_core::record::RecordLayer::new(keys, &nonce);
+
+            // Client will process Half-RTT and start sending DataRecords
+            // We don't have early_data (0-RTT was rejected), so return empty
+            Ok(ServerOutcome {
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record,
+                    role: Role::Server,
+                },
+                early_data: Vec::new(),
             })
         }
         ServerStep::OneRtt { hello, selected } => {

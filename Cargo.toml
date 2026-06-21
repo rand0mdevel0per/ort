@@ -23,6 +23,9 @@ ort-proto = { path = "crates/ort-proto" }
 ort-net = { path = "crates/ort-net" }
 ort-cli = { path = "crates/ort-cli" }
 
+# benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # crypto
 ml-kem = { version = "0.3", features = ["hazmat"] }
 ml-dsa = "0.1"
