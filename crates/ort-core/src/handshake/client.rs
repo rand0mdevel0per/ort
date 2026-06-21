@@ -59,7 +59,7 @@ fn build_payload<C: Clock>(
 
     // Encapsulate against this suite's server key; derive session keys from the
     // shared secret (zeroized immediately after).
-    let r = fresh_r()?;
+    let r = Zeroizing::new(fresh_r()?);
     let (ciphertext, shared) = agile::kem_encapsulate(suite, server_pk, &r)?;
     let shared = Zeroizing::new(shared);
     let keys = derive_session_keys(&shared, &nonce);
@@ -146,7 +146,7 @@ pub fn client_half_rtt_finish(
     server_ct: &[u8],
     nonce: &[u8; 32],
 ) -> Result<()> {
-    let temp_kem = est.temp_kem_secret.as_ref().ok_or(Error::UnexpectedMessage("no temp KEM secret"))?;
+    let temp_kem = est.temp_kem_secret.take().ok_or(Error::UnexpectedMessage("no temp KEM secret"))?;
     let shared = Zeroizing::new(temp_kem.decapsulate(server_ct)?);
     let keys = derive_session_keys(&shared, nonce);
     est.record = RecordLayer::new(keys, nonce);

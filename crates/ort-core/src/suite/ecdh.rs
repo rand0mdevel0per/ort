@@ -9,6 +9,7 @@ use crate::{Error, Result};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 /// Domain-separation label for the DHKEM key schedule.
 const DHKEM_LABEL: &[u8] = b"ORT-dhkem-x25519-v1";
@@ -68,7 +69,9 @@ impl CipherSuite for Ecdh {
     fn kem_generate() -> Self::KemSecret {
         let mut seed = [0u8; 32];
         super::fill_random(&mut seed).expect("OS RNG");
-        KemSecret(StaticSecret::from(seed))
+        let secret = KemSecret(StaticSecret::from(seed));
+        seed.zeroize();
+        secret
     }
 
     fn kem_secret_from_bytes(seed: &[u8]) -> Result<Self::KemSecret> {
@@ -106,7 +109,9 @@ impl CipherSuite for Ecdh {
     fn sig_generate() -> Self::SigSecret {
         let mut seed = [0u8; 32];
         super::fill_random(&mut seed).expect("OS RNG");
-        SigSecret(SigningKey::from_bytes(&seed))
+        let secret = SigSecret(SigningKey::from_bytes(&seed));
+        seed.zeroize();
+        secret
     }
 
     fn sig_secret_from_bytes(seed: &[u8]) -> Result<Self::SigSecret> {
