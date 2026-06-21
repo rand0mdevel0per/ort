@@ -21,3 +21,4 @@ clap.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 rcgen.workspace = true
+pkcs8 = { version = "0.10", features = ["std"] }

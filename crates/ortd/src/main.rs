@@ -178,13 +178,14 @@ fn load_server_config(args: &RunArgs) -> Result<ServerConfig> {
             .filter(|p| p.exists())
             .map(|p| {
                 let der = read_key(&p)?;
-                // rcgen serializes Ed25519 keys as DER; extract the 32-byte seed
-                // DER format: SEQUENCE { version, SEQUENCE { OID }, OCTET STRING (seed) }
-                // For simplicity, assume the last 32 bytes are the seed
-                if der.len() < 32 {
-                    anyhow::bail!("cert signing key too short");
+                // Use proper PKCS#8 parser to extract the Ed25519 seed
+                // (avoids tail-slice heuristic that breaks on v2 format)
+                let key_info = pkcs8::PrivateKeyInfo::try_from(der.as_slice())
+                    .context("parse PKCS#8 private key")?;
+                let seed = key_info.private_key;
+                if seed.len() != 32 {
+                    anyhow::bail!("Ed25519 seed must be 32 bytes, got {}", seed.len());
                 }
-                let seed = &der[der.len() - 32..];
                 // Certificate signing always uses Ed25519 (X25519Ed25519 suite)
                 ort_core::suite::agile::SigIdentity::from_seed(SuiteId::X25519Ed25519, seed)
                     .context("parse cert signing key")

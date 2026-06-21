@@ -118,7 +118,12 @@ pub async fn client_1rtt<C: Clock>(
         let (cert_vk, sig_suite) = crate::cert::extract_signing_key(&certificate)?;
 
         // Verify server_pk signature to prove ownership
-        if !server_pk_signature.is_empty() {
+        // In strict mode, empty signature is a hard failure (MITM risk)
+        if server_pk_signature.is_empty() {
+            if matches!(verifier, ServerVerifier::Strict { .. }) {
+                return Err(OrtError::Cert("server_pk_signature is required in strict mode".into()));
+            }
+        } else {
             let server_pk_hash = ort_core::prim::hash256(&server_pk);
             ort_core::suite::agile::sig_verify(sig_suite, &cert_vk, &server_pk_hash, &server_pk_signature)?;
         }

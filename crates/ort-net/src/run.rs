@@ -105,6 +105,8 @@ fn is_zero_rtt_fallback(e: &crate::OrtError) -> bool {
             | crate::OrtError::KeyConfirmation
             | crate::OrtError::EarlyClose
             | crate::OrtError::PinMismatch
+            | crate::OrtError::Cert(_)
+            | crate::OrtError::Core(_)
     )
 }
 
