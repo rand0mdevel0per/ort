@@ -9,3 +9,6 @@ description = "ORT wire format: frame message types and length-prefixed binary c
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

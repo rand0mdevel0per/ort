@@ -6,41 +6,35 @@ use crate::error::{OrtError, Result};
 use crate::transport::{FramedReader, FramedWriter};
 
 use ort_core::handshake::{
-    client_one_rtt_finish, client_one_rtt_hello, client_zero_rtt, server_on_client_data,
+    client_offer_zero_rtt, client_one_rtt_finish, client_one_rtt_hello, server_on_client_data,
     server_on_first, ClientConfig, ServerConfig, ServerStep,
 };
 use ort_core::pool::Direction;
 use ort_core::record::RecordLayer;
-use ort_core::replay::StrikeCache;
-use ort_core::suite::v1::V1;
+use ort_core::replay::ReplayGuard;
+use ort_core::suite::SuiteId;
 use ort_core::time::Clock;
 use ort_proto::Frame;
 
-use std::sync::Arc;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 
 /// Which end of the tunnel a connection is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// `ortc`: local app side.
+    /// `ortc`: local app side (seals client→server).
     Client,
-    /// `ortd`: target/backend side.
+    /// `ortd`: target/backend side (seals server→client).
     Server,
 }
 
 impl Role {
-    /// Direction used when sealing data this side sends into the tunnel.
+    /// Direction this side seals into.
     pub fn send_dir(self) -> Direction {
         match self {
             Role::Client => Direction::ClientToServer,
             Role::Server => Direction::ServerToClient,
         }
-    }
-    /// Direction used when opening data received from the tunnel.
-    pub fn recv_dir(self) -> Direction {
-        self.send_dir().flip()
     }
 }
 
@@ -51,71 +45,199 @@ pub struct OrtConn {
     /// Framed writer over the tunnel socket.
     pub writer: FramedWriter<OwnedWriteHalf>,
     /// AEAD record layer for application traffic.
-    pub record: RecordLayer<V1>,
+    pub record: RecordLayer,
     /// This connection's role.
     pub role: Role,
 }
 
-/// Result of a client handshake.
-pub struct ClientOutcome {
-    /// Established connection.
-    pub conn: OrtConn,
-    /// If 0-RTT, the expected `BLAKE3-512(enc_key)` to validate the ServerAck.
-    pub expect_ack: Option<[u8; 64]>,
-    /// The server KEM public key in use (to pin/cache for future 0-RTT).
+/// Server key info learned from a 1-RTT handshake, to cache for 0-RTT.
+#[derive(Debug, Clone)]
+pub struct Learned {
+    /// Client source IP as observed by the server (NAT-safe).
+    pub observed_ip: [u8; 16],
+    /// Suite the server accepted.
+    pub accepted_suite: SuiteId,
+    /// Server KEM public key for that suite.
     pub server_pk: Vec<u8>,
+    /// Server's certificate (DER), for Half-RTT signature verification.
+    pub certificate: Vec<u8>,
 }
 
-/// Drive the client side of the handshake.
-#[allow(clippy::too_many_arguments)]
-pub async fn client_open<C: Clock>(
+/// Result of a client handshake.
+pub struct ClientOutcome {
+    /// Established connection (handshake fully complete, incl. 0-RTT ServerAck).
+    pub conn: OrtConn,
+    /// 1-RTT only: server key info to cache for future 0-RTT.
+    pub learned: Option<Learned>,
+}
+
+fn split(stream: TcpStream) -> (FramedReader<OwnedReadHalf>, FramedWriter<OwnedWriteHalf>) {
+    let _ = stream.set_nodelay(true);
+    let (r, w) = stream.into_split();
+    (FramedReader::new(r), FramedWriter::new(w))
+}
+
+/// Drive the client's 1-RTT handshake (first contact). Advertises `kem_suites`.
+pub async fn client_1rtt<C: Clock>(
     stream: TcpStream,
-    ccfg: &ClientConfig<V1>,
-    src_ip: [u8; 16],
-    cached_server_pk: Option<Vec<u8>>,
-    force_1rtt: bool,
+    cfg: &ClientConfig,
+    kem_suites: &[SuiteId],
     verifier: &ServerVerifier,
+    pinned: Option<&[u8]>,
     clock: &C,
     early_data: &[u8],
 ) -> Result<ClientOutcome> {
-    let _ = stream.set_nodelay(true);
-    let (r, w) = stream.into_split();
-    let mut reader = FramedReader::new(r);
-    let mut writer = FramedWriter::new(w);
+    let (mut reader, mut writer) = split(stream);
+    writer
+        .write_frame(&client_one_rtt_hello(cfg, kem_suites).encode())
+        .await?;
 
-    match (&cached_server_pk, force_1rtt) {
-        (Some(spk), false) => {
-            // 0-RTT
-            let (frame, est) = client_zero_rtt(ccfg, spk, src_ip, clock, early_data)?;
-            writer.write_frame(&frame.encode()).await?;
-            Ok(ClientOutcome {
-                conn: OrtConn { reader, writer, record: est.record, role: Role::Client },
-                expect_ack: Some(est.expected_ek_hash),
-                server_pk: spk.clone(),
-            })
-        }
-        _ => {
-            // 1-RTT
-            writer.write_frame(&client_one_rtt_hello(ccfg).encode()).await?;
-            let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
-            let (server_pk, certificate) = match Frame::decode(&body)? {
-                Frame::ServerHello { server_pk, certificate, .. } => (server_pk, certificate),
-                _ => return Err(OrtError::Unexpected("expected ServerHello")),
-            };
-            verifier.verify(&server_pk, &certificate)?;
-            if let Some(pin) = &cached_server_pk {
-                if pin != &server_pk {
-                    return Err(OrtError::PinMismatch);
-                }
+    let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
+    let (accepted_suite, server_pk, server_pk_signature, certificate, observed_ip) = match Frame::decode(&body)? {
+        Frame::ServerHello {
+            accepted_suite,
+            server_pk,
+            server_pk_signature,
+            certificate,
+            observed_ip,
+            ..
+        } => (accepted_suite, server_pk, server_pk_signature, certificate, observed_ip),
+        Frame::ServerReject { reason } => return Err(OrtError::Rejected(reason)),
+        _ => return Err(OrtError::Unexpected("expected ServerHello")),
+    };
+
+    let suite =
+        SuiteId::from_code(accepted_suite).ok_or(OrtError::UnexpectedSuite(accepted_suite))?;
+    if !kem_suites.contains(&suite) {
+        return Err(OrtError::UnexpectedSuite(accepted_suite));
+    }
+
+    // Verify certificate (if present) and server_pk signature
+    if !certificate.is_empty() {
+        verifier.verify(&certificate)?;
+        let (cert_vk, sig_suite) = crate::cert::extract_signing_key(&certificate)?;
+
+        // Verify server_pk signature to prove ownership
+        // In strict mode, empty signature is a hard failure (MITM risk)
+        if server_pk_signature.is_empty() {
+            if matches!(verifier, ServerVerifier::Strict { .. }) {
+                return Err(OrtError::Cert("server_pk_signature is required in strict mode".into()));
             }
-            let (frame, est) = client_one_rtt_finish(ccfg, &server_pk, src_ip, clock, early_data)?;
-            writer.write_frame(&frame.encode()).await?;
+        } else {
+            let server_pk_hash = ort_core::prim::hash256(&server_pk);
+            ort_core::suite::agile::sig_verify(sig_suite, &cert_vk, &server_pk_hash, &server_pk_signature)?;
+        }
+    } else {
+        // No certificate: TOFU mode or test environment
+        // Signature verification is skipped (trust on first use)
+    }
+
+    if let Some(pin) = pinned {
+        if pin != server_pk {
+            return Err(OrtError::PinMismatch);
+        }
+    }
+
+    let (frame, est) =
+        client_one_rtt_finish(cfg, suite, &server_pk, observed_ip, clock, early_data)?;
+    writer.write_frame(&frame.encode()).await?;
+
+    Ok(ClientOutcome {
+        conn: OrtConn {
+            reader,
+            writer,
+            record: est.record,
+            role: Role::Client,
+        },
+        learned: Some(Learned {
+            observed_ip,
+            accepted_suite: suite,
+            server_pk,
+            certificate,
+        }),
+    })
+}
+
+/// Drive the client's 0-RTT handshake resuming a single cached `suite` (with
+/// its `server_pk`) and the previously server-observed `src_ip`. The ServerAck
+/// is read and verified inline, so the returned connection is fully confirmed;
+/// a `ServerReject` (e.g. the server dropped the suite) surfaces as
+/// [`OrtError::Rejected`] so the caller can fall back to 1-RTT.
+pub async fn client_0rtt<C: Clock>(
+    stream: TcpStream,
+    cfg: &ClientConfig,
+    suite: SuiteId,
+    server_pk: &[u8],
+    server_cert: &[u8],
+    src_ip: [u8; 16],
+    clock: &C,
+    early_data: &[u8],
+) -> Result<ClientOutcome> {
+    let (mut reader, mut writer) = split(stream);
+    let (frame, mut est) = client_offer_zero_rtt(cfg, suite, server_pk, src_ip, clock, early_data)?;
+    writer.write_frame(&frame.encode()).await?;
+
+    // Await server response: ServerAck (0-RTT) or ServerRefuse0RTT (Half-RTT)
+    let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
+    match Frame::decode(&body)? {
+        Frame::ServerAck { accepted_suite, ek_hash } => {
+            if accepted_suite != est.offered_suite.code() {
+                return Err(OrtError::UnexpectedSuite(accepted_suite));
+            }
+            if ek_hash != est.expected_ek_hash {
+                return Err(OrtError::KeyConfirmation);
+            }
+            // 0-RTT success
             Ok(ClientOutcome {
-                conn: OrtConn { reader, writer, record: est.record, role: Role::Client },
-                expect_ack: None,
-                server_pk,
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: est.record,
+                    role: Role::Client,
+                },
+                learned: None,
             })
         }
+        Frame::ServerRefuse0RTT {
+            accepted_suite,
+            server_ct,
+            nonce,
+            server_signature,
+        } => {
+            // Half-RTT fallback: server rejected 0-RTT but provided server_ct + signature
+            if accepted_suite != est.offered_suite.code() {
+                return Err(OrtError::UnexpectedSuite(accepted_suite));
+            }
+
+            // Extract server's signing public key from cached certificate
+            // TODO: This should parse the certificate and extract the public key
+            // For now, we need a helper function in cert module
+            let (server_vk, sig_suite) = crate::cert::extract_signing_key(server_cert)?;
+
+            // Verify server signature and establish channel
+            ort_core::handshake::client_half_rtt_finish(
+                &mut est,
+                accepted_suite,
+                &server_ct,
+                &nonce,
+                &server_signature,
+                &server_vk,
+                sig_suite,
+            )?;
+
+            // Channel established, early data was NOT delivered (0-RTT rejected)
+            Ok(ClientOutcome {
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: est.record,
+                    role: Role::Client,
+                },
+                learned: None,
+            })
+        }
+        Frame::ServerReject { reason } => Err(OrtError::Rejected(reason)),
+        _ => Err(OrtError::Unexpected("expected ServerAck or ServerRefuse0RTT")),
     }
 }
 
@@ -127,47 +249,85 @@ pub struct ServerOutcome {
     pub early_data: Vec<u8>,
 }
 
-/// Drive the server side of the handshake.
-pub async fn server_accept<C: Clock>(
+/// Drive the server side of the handshake. On no-common-suite the server sends
+/// a ServerReject and this returns [`OrtError::Rejected`].
+pub async fn server_accept<C: Clock, G: ReplayGuard>(
     stream: TcpStream,
     peer_ip: [u8; 16],
-    scfg: &ServerConfig<V1>,
-    strike: &Arc<Mutex<StrikeCache>>,
+    scfg: &ServerConfig,
+    guard: &G,
     clock: &C,
 ) -> Result<ServerOutcome> {
-    let _ = stream.set_nodelay(true);
-    let (r, w) = stream.into_split();
-    let mut reader = FramedReader::new(r);
-    let mut writer = FramedWriter::new(w);
+    let (mut reader, mut writer) = split(stream);
 
     let body = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
     let frame = Frame::decode(&body)?;
-
-    let step = {
-        let mut s = strike.lock().await;
-        server_on_first(scfg, &frame, peer_ip, clock, &mut s)?
-    };
+    let step = server_on_first(scfg, &frame, peer_ip, clock, guard)?;
 
     match step {
-        ServerStep::ZeroRtt { ack, established } => {
+        ServerStep::ZeroRtt {
+            ack, established, ..
+        } => {
             writer.write_frame(&ack.encode()).await?;
             Ok(ServerOutcome {
-                conn: OrtConn { reader, writer, record: established.record, role: Role::Server },
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: established.record,
+                    role: Role::Server,
+                },
                 early_data: established.early_data,
             })
         }
-        ServerStep::OneRtt { hello } => {
+        ServerStep::HalfRtt {
+            accepted_suite: _,
+            frame,
+            shared,
+            nonce,
+        } => {
+            // Send ServerRefuse0RTT to client
+            writer.write_frame(&frame.encode()).await?;
+
+            // Derive session keys from the shared secret and nonce
+            let keys = ort_core::kdf::derive_session_keys(&shared, &nonce);
+            let record = ort_core::record::RecordLayer::new(keys, &nonce);
+
+            // Client will process Half-RTT and start sending DataRecords
+            // We don't have early_data (0-RTT was rejected), so return empty
+            Ok(ServerOutcome {
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record,
+                    role: Role::Server,
+                },
+                early_data: Vec::new(),
+            })
+        }
+        ServerStep::OneRtt { hello, selected } => {
             writer.write_frame(&hello.encode()).await?;
             let body2 = reader.read_frame().await?.ok_or(OrtError::EarlyClose)?;
             let frame2 = Frame::decode(&body2)?;
-            let established = {
-                let mut s = strike.lock().await;
-                server_on_client_data(scfg, &frame2, peer_ip, clock, &mut s)?
-            };
+            let established =
+                server_on_client_data(scfg, &frame2, peer_ip, clock, guard, selected)?;
             Ok(ServerOutcome {
-                conn: OrtConn { reader, writer, record: established.record, role: Role::Server },
+                conn: OrtConn {
+                    reader,
+                    writer,
+                    record: established.record,
+                    role: Role::Server,
+                },
                 early_data: established.early_data,
             })
+        }
+        ServerStep::Reject { frame } => {
+            let reason = match &frame {
+                Frame::ServerReject { reason } => *reason,
+                _ => 0,
+            };
+            writer.write_frame(&frame.encode()).await?;
+            let _ = writer.shutdown().await;
+            Err(OrtError::Rejected(reason))
         }
     }
 }

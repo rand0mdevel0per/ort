@@ -11,6 +11,8 @@ description = "ORT protocol core: cipher suites, handshake state machine, framin
 ort-proto.workspace = true
 ml-kem.workspace = true
 ml-dsa.workspace = true
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
@@ -22,3 +24,12 @@ thiserror.workspace = true
 [dev-dependencies]
 rand.workspace = true
 hex = "0.4"
+criterion.workspace = true
+
+[[bench]]
+name = "crypto"
+harness = false
+
+[[bench]]
+name = "handshake"
+harness = false

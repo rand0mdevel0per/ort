@@ -2,7 +2,7 @@
 //!
 //! Every primitive the protocol needs is exposed through [`CipherSuite`] using
 //! byte-oriented signatures so the handshake/record code never touches a
-//! concrete crypto crate's generic types. v1 ([`v1::V1`]) binds:
+//! concrete crypto crate's generic types. PQC ([`pqc::Pqc`]) binds:
 //! ML-KEM-768 + ML-DSA-65 + AES-256-GCM + HKDF-SHA256 + BLAKE3.
 //!
 //! Key agreement is a **KEM** (not a NIKE): the client picks a fresh 32-byte
@@ -11,23 +11,23 @@
 //! `shared` by decapsulating `ciphertext` with its secret key. Because `r` is
 //! fresh per connection, every session has an independent shared secret.
 
+pub mod agile;
+pub mod ecdh;
 pub mod ids;
-pub mod v1;
+pub mod pqc;
 
 pub use ids::SuiteId;
 
 use crate::Result;
 
-/// Length in bytes of the KEM shared secret / AEAD key (32 for v1).
+/// Length in bytes of the KEM shared secret / AEAD key (32).
 pub const SHARED_LEN: usize = 32;
-/// AEAD nonce length in bytes (96-bit GCM nonce).
-pub const NONCE_LEN: usize = 12;
-/// AEAD authentication tag length in bytes.
-pub const TAG_LEN: usize = 16;
-/// Length of the encapsulation seed `r` (= "shrand").
+/// Length of the encapsulation seed `r`.
 pub const R_LEN: usize = 32;
 
-/// The full set of primitives for one protocol version, exposed over bytes.
+/// A cipher suite's asymmetric primitives (KEM + signature), exposed over
+/// bytes. The symmetric primitives (AEAD/KDF/hash) are fixed for all suites and
+/// live in [`crate::prim`], so an established session is suite-independent.
 pub trait CipherSuite {
     /// On-wire identifier negotiated in ClientHello.
     const ID: SuiteId;
@@ -57,9 +57,9 @@ pub trait CipherSuite {
     fn kem_secret_to_bytes(secret: &Self::KemSecret) -> Vec<u8>;
     /// Encapsulation (public) key bytes for this secret.
     fn kem_public(secret: &Self::KemSecret) -> Vec<u8>;
-    /// Decapsulate a ciphertext, recovering the shared secret. Uses ML-KEM
-    /// implicit rejection, so a malformed/forged ct yields a pseudo-random
-    /// secret rather than an error (the AEAD open will then fail).
+    /// Decapsulate a ciphertext, recovering the shared secret. A
+    /// malformed/forged ct yields a pseudo-random secret rather than an error
+    /// (the AEAD open then fails), preserving implicit-rejection semantics.
     fn kem_decapsulate(secret: &Self::KemSecret, ct: &[u8]) -> Result<[u8; SHARED_LEN]>;
     /// Deterministic encapsulation against an encoded public key using seed
     /// `r`. Returns `(ciphertext, shared)`.
@@ -69,9 +69,9 @@ pub trait CipherSuite {
 
     /// Generate a fresh signing secret using the OS RNG.
     fn sig_generate() -> Self::SigSecret;
-    /// Reconstruct a signing secret from its 32-byte seed.
+    /// Reconstruct a signing secret from its seed.
     fn sig_secret_from_bytes(seed: &[u8]) -> Result<Self::SigSecret>;
-    /// Serialize a signing secret to its 32-byte seed.
+    /// Serialize a signing secret to its seed.
     fn sig_secret_to_bytes(secret: &Self::SigSecret) -> Vec<u8>;
     /// Verifying (public) key bytes for this signing secret.
     fn sig_public(secret: &Self::SigSecret) -> Vec<u8>;
@@ -79,37 +79,18 @@ pub trait CipherSuite {
     fn sig_sign(secret: &Self::SigSecret, msg: &[u8]) -> Vec<u8>;
     /// Verify a signature against an encoded verifying key.
     fn sig_verify(vk: &[u8], msg: &[u8], sig: &[u8]) -> Result<()>;
-
-    // --- AEAD --------------------------------------------------------------
-
-    /// Seal `pt` with associated data `aad`. Returns `ciphertext || tag`.
-    fn aead_seal(key: &[u8; SHARED_LEN], nonce: &[u8; NONCE_LEN], aad: &[u8], pt: &[u8]) -> Vec<u8>;
-    /// Open `ct` (== `ciphertext || tag`); fails authentication on tamper.
-    fn aead_open(
-        key: &[u8; SHARED_LEN],
-        nonce: &[u8; NONCE_LEN],
-        aad: &[u8],
-        ct: &[u8],
-    ) -> Result<Vec<u8>>;
-
-    // --- KDF & hash --------------------------------------------------------
-
-    /// HKDF-Extract+Expand into `out`.
-    fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]);
-    /// 256-bit hash.
-    fn hash256(data: &[u8]) -> [u8; 32];
-    /// 512-bit hash (XOF-extended).
-    fn hash512(data: &[u8]) -> [u8; 64];
 }
 
 /// Fill a buffer with cryptographically secure random bytes from the OS.
-pub fn fill_random(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("OS RNG failure");
+/// Returns an error (rather than panicking) if the OS RNG fails, so callers on
+/// the per-connection path can reject instead of crashing.
+pub fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::fill(buf).map_err(|_| crate::Error::RngFailure)
 }
 
-/// Generate a fresh 32-byte encapsulation seed `r` ("shrand").
-pub fn fresh_r() -> [u8; R_LEN] {
+/// Generate a fresh 32-byte encapsulation seed `r`.
+pub fn fresh_r() -> Result<[u8; R_LEN]> {
     let mut r = [0u8; R_LEN];
-    fill_random(&mut r);
-    r
+    fill_random(&mut r)?;
+    Ok(r)
 }

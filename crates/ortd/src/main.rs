@@ -1,22 +1,49 @@
 //! `ortd` — the ORT server daemon.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use ort_cli::{hex, init_tracing, read_key, write_key};
-use ort_core::handshake::ServerConfig;
-use ort_core::suite::v1::V1;
-use ort_core::suite::CipherSuite;
-use ort_net::{run_server, SERVERPK_OID_U64};
+use ort_core::handshake::{ServerConfig, SuiteKey};
+use ort_core::suite::agile::ServerKemKey;
+use ort_core::suite::SuiteId;
+use ort_net::run_server;
 use tokio::net::TcpListener;
 
-const KEM_KEY_FILE: &str = "server_kem.key";
-const SIGN_KEY_FILE: &str = "server_sign.key";
-const CERT_FILE: &str = "cert.der";
+/// Suites the server can hold keys for.
+const ALL_SUITES: [SuiteId; 2] = [SuiteId::MlKem768MlDsa65, SuiteId::X25519Ed25519];
+
+fn suite_name(id: SuiteId) -> &'static str {
+    match id {
+        SuiteId::MlKem768MlDsa65 => "pqc",
+        SuiteId::X25519Ed25519 => "ecdh",
+    }
+}
+fn kem_file(id: SuiteId) -> String {
+    format!("kem_{}.key", suite_name(id))
+}
+fn cert_file(id: SuiteId) -> String {
+    format!("cert_{}.der", suite_name(id))
+}
+fn cert_signing_file(id: SuiteId) -> String {
+    format!("cert_{}_signing.key", suite_name(id))
+}
+
+fn parse_suites(s: &str) -> Result<Vec<SuiteId>> {
+    if s == "all" {
+        return Ok(ALL_SUITES.to_vec());
+    }
+    s.split(',')
+        .map(|p| {
+            SuiteId::from_name(p.trim())
+                .ok_or_else(|| anyhow::anyhow!("unknown suite '{}' (expected pqc, ecdh or all)", p.trim()))
+        })
+        .collect()
+}
 
 #[derive(Parser)]
 #[command(
@@ -33,11 +60,10 @@ struct Cli {
 enum Commands {
     /// Run the server (also the default when no subcommand is given).
     Run(RunArgs),
-    /// Generate a server KEM + signing keypair and print the public key.
-    GenKey(GenKeyArgs),
-    /// Generate (or reuse) a server key and a self-signed certificate that
-    /// binds the ML-KEM public key via a custom extension.
-    GenCert(GenKeyArgs),
+    /// Generate server KEM keypair(s) and print the public key(s).
+    GenKey(GenArgs),
+    /// Generate (or reuse) KEM key(s) + self-signed cert(s) binding the key(s).
+    GenCert(GenArgs),
 }
 
 #[derive(Args)]
@@ -48,8 +74,8 @@ struct RunArgs {
     /// Backend target to forward decrypted plaintext to.
     #[arg(long)]
     target: SocketAddr,
-    /// Directory holding the server key (and optional cert). If omitted, an
-    /// ephemeral key is generated (clients must use --no-strict-cert TOFU).
+    /// Directory holding per-suite keys (and optional certs). If omitted,
+    /// ephemeral keys for all suites are generated.
     #[arg(long)]
     cert: Option<PathBuf>,
     /// Anti-replay acceptance window in milliseconds.
@@ -61,95 +87,128 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct GenKeyArgs {
-    /// Output directory for the generated keys.
+struct GenArgs {
+    /// Output directory for the generated keys/certs.
     #[arg(long, default_value = "./cert")]
     out: PathBuf,
+    /// Which suites to generate for: `v1`, `v2`, comma-separated, or `all`.
+    #[arg(long, default_value = "all")]
+    suite: String,
 }
 
-fn gen_key(args: GenKeyArgs) -> Result<()> {
-    let kem = V1::kem_generate();
-    let sign = V1::sig_generate();
-    let server_pk = V1::kem_public(&kem);
-
-    write_key(&args.out.join(KEM_KEY_FILE), &V1::kem_secret_to_bytes(&kem))?;
-    write_key(&args.out.join(SIGN_KEY_FILE), &V1::sig_secret_to_bytes(&sign))?;
-
-    println!("generated server keys in {}", args.out.display());
-    println!("server_pk (pin this on clients): {}", hex(&server_pk));
-    Ok(())
-}
-
-fn load_or_make_kem(dir: &std::path::Path) -> Result<ort_core::suite::v1::KemSecret> {
-    let path = dir.join(KEM_KEY_FILE);
+fn load_or_make_kem(dir: &Path, id: SuiteId) -> Result<ServerKemKey> {
+    let path = dir.join(kem_file(id));
     if path.exists() {
         let seed = read_key(&path)?;
-        V1::kem_secret_from_bytes(&seed).context("decode server KEM key")
+        ServerKemKey::from_seed(id, &seed).context("decode server KEM key")
     } else {
-        let kem = V1::kem_generate();
-        write_key(&path, &V1::kem_secret_to_bytes(&kem))?;
-        let sign = V1::sig_generate();
-        write_key(&dir.join(SIGN_KEY_FILE), &V1::sig_secret_to_bytes(&sign))?;
-        Ok(kem)
+        let key = ServerKemKey::generate(id);
+        write_key(&path, &key.to_seed())?;
+        Ok(key)
     }
 }
 
-fn gen_cert(args: GenKeyArgs) -> Result<()> {
-    use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ED25519};
-
-    let kem = load_or_make_kem(&args.out)?;
-    let server_pk = V1::kem_public(&kem);
-
-    let key_pair = KeyPair::generate_for(&PKCS_ED25519).context("generate cert key")?;
-    let mut params = CertificateParams::new(vec!["ortd".to_string()]).context("cert params")?;
-    params
-        .custom_extensions
-        .push(CustomExtension::from_oid_content(SERVERPK_OID_U64, server_pk.clone()));
-    let cert = params.self_signed(&key_pair).context("self-sign cert")?;
-
-    std::fs::write(args.out.join(CERT_FILE), cert.der().as_ref()).context("write cert.der")?;
-    write_key(&args.out.join("cert_signing.key"), key_pair.serialize_der().as_slice())?;
-
-    println!("wrote certificate to {}", args.out.join(CERT_FILE).display());
-    println!("server_pk (bound in cert): {}", hex(&server_pk));
+fn gen_key(args: GenArgs) -> Result<()> {
+    for id in parse_suites(&args.suite)? {
+        let key = load_or_make_kem(&args.out, id)?;
+        println!("[{}] server_pk: {}", suite_name(id), hex(&key.public()));
+    }
+    println!("keys in {}", args.out.display());
     Ok(())
 }
 
-fn load_server_config(args: &RunArgs) -> Result<ServerConfig<V1>> {
-    let kem_secret = match &args.cert {
-        Some(dir) => {
-            let seed = read_key(&dir.join(KEM_KEY_FILE))
-                .with_context(|| "load server KEM key (run `ortd gen-key` first)")?;
-            V1::kem_secret_from_bytes(&seed).context("decode server KEM key")?
-        }
-        None => {
-            tracing::warn!("no --cert dir given; generating an ephemeral KEM key for this run");
-            V1::kem_generate()
-        }
-    };
-    let server_pk = V1::kem_public(&kem_secret);
-    tracing::info!(server_pk = %hex(&server_pk), "server public key");
+fn gen_cert(args: GenArgs) -> Result<()> {
+    use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
+    for id in parse_suites(&args.suite)? {
+        let key = load_or_make_kem(&args.out, id)?;
+        let server_pk = key.public();
 
-    let certificate = args
-        .cert
-        .as_ref()
-        .map(|d| d.join(CERT_FILE))
-        .filter(|p| p.exists())
-        .map(std::fs::read)
-        .transpose()
-        .context("reading certificate")?
-        .unwrap_or_default();
+        // Reuse the cert signing key across runs so re-issuing a cert keeps a
+        // stable X.509 identity (clients pinning the cert keep working).
+        let signing_path = args.out.join(cert_signing_file(id));
+        let kp = if signing_path.exists() {
+            let der = read_key(&signing_path)?;
+            KeyPair::try_from(&der[..]).context("load cert signing key")?
+        } else {
+            let kp = KeyPair::generate_for(&PKCS_ED25519).context("generate cert key")?;
+            write_key(&signing_path, kp.serialize_der().as_slice())?;
+            kp
+        };
 
+        // Standard X.509 certificate (no custom extensions)
+        let params = CertificateParams::new(vec!["ortd".to_string()]).context("cert params")?;
+        let cert = params.self_signed(&kp).context("self-sign cert")?;
+        std::fs::write(args.out.join(cert_file(id)), cert.der().as_ref()).context("write cert")?;
+        println!(
+            "[{}] wrote cert; server_pk: {}",
+            suite_name(id),
+            hex(&server_pk)
+        );
+    }
+    Ok(())
+}
+
+fn load_server_config(args: &RunArgs) -> Result<ServerConfig> {
+    let mut suites = Vec::new();
+    for id in ALL_SUITES {
+        let key = match &args.cert {
+            Some(dir) if dir.join(kem_file(id)).exists() => {
+                let seed = read_key(&dir.join(kem_file(id)))?;
+                ServerKemKey::from_seed(id, &seed).context("decode KEM key")?
+            }
+            Some(_) => continue,                // this suite not configured
+            None => ServerKemKey::generate(id), // ephemeral for all suites
+        };
+        let certificate = args
+            .cert
+            .as_ref()
+            .map(|d| d.join(cert_file(id)))
+            .filter(|p| p.exists())
+            .map(std::fs::read)
+            .transpose()
+            .context("reading certificate")?
+            .unwrap_or_default();
+
+        // Load certificate signing key (for Half-RTT authentication)
+        // Note: gen_cert uses Ed25519 for all suites' certificates (regardless of KEM)
+        let cert_signing_key = args
+            .cert
+            .as_ref()
+            .map(|d| d.join(cert_signing_file(id)))
+            .filter(|p| p.exists())
+            .map(|p| {
+                let der = read_key(&p)?;
+                // Use proper PKCS#8 parser to extract the Ed25519 seed
+                // (avoids tail-slice heuristic that breaks on v2 format)
+                let key_info = pkcs8::PrivateKeyInfo::try_from(der.as_slice())
+                    .context("parse PKCS#8 private key")?;
+                let seed = key_info.private_key;
+                if seed.len() != 32 {
+                    anyhow::bail!("Ed25519 seed must be 32 bytes, got {}", seed.len());
+                }
+                // Certificate signing always uses Ed25519 (X25519Ed25519 suite)
+                ort_core::suite::agile::SigIdentity::from_seed(SuiteId::X25519Ed25519, seed)
+                    .context("parse cert signing key")
+            })
+            .transpose()?;
+
+        tracing::info!(suite = suite_name(id), server_pk = %hex(&key.public()), "loaded suite");
+        suites.push(SuiteKey { key, certificate, cert_signing_key });
+    }
+    if suites.is_empty() {
+        anyhow::bail!("no server keys found in --cert dir (run `ortd gen-key` first)");
+    }
     Ok(ServerConfig {
-        kem_secret,
-        server_pk,
-        certificate,
+        suites,
         window_ms: args.window_ms,
         skew_ms: args.skew_ms,
     })
 }
 
 async fn run(args: RunArgs) -> Result<()> {
+    if args.cert.is_none() {
+        tracing::warn!("no --cert dir; generating ephemeral keys for all suites");
+    }
     let scfg = Arc::new(load_server_config(&args)?);
     let listener = TcpListener::bind(args.listen)
         .await
@@ -162,9 +221,6 @@ async fn run(args: RunArgs) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-
-    // Allow the bare form `ortd --listen ... --target ...` (no subcommand) by
-    // defaulting to `run` when the first argument looks like an option.
     let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if argv.len() > 1 {
         let a = argv[1].to_string_lossy();
@@ -176,11 +232,9 @@ async fn main() -> Result<()> {
             argv.insert(1, std::ffi::OsString::from("run"));
         }
     }
-
-    let cli = Cli::parse_from(argv);
-    match cli.command {
-        Commands::GenKey(args) => gen_key(args),
-        Commands::GenCert(args) => gen_cert(args),
-        Commands::Run(args) => run(args).await,
+    match Cli::parse_from(argv).command {
+        Commands::GenKey(a) => gen_key(a),
+        Commands::GenCert(a) => gen_cert(a),
+        Commands::Run(a) => run(a).await,
     }
 }

@@ -1,20 +1,13 @@
 //! Server public-key verification policy.
 //!
-//! The server's ML-KEM public key is bound into an X.509 certificate via a
-//! private custom extension. Strict verification parses that certificate,
-//! checks its validity and signature (self-signed, or against a pinned CA), and
-//! requires the embedded key to equal the `server_pk` presented in ServerHello —
-//! closing the MITM key-substitution gap. `--no-strict-cert` instead trusts the
-//! key on first use (TOFU) and relies on caller-side pinning.
+//! The server's certificate is a standard X.509 certificate. The server proves
+//! ownership of KEM public keys by signing them with the certificate's private key.
+//! Strict verification parses the certificate, checks its validity and signature
+//! (self-signed, or against a pinned CA). `--no-strict-cert` trusts on first use (TOFU)
+//! and relies on caller-side pinning.
 
 use crate::error::OrtError;
 use x509_parser::prelude::*;
-
-/// Private-enterprise OID carrying the bound ML-KEM ServerPK (numeric form).
-/// (58271 is an unregistered placeholder PEN — documented in SPEC.md.)
-pub const SERVERPK_OID_U64: &[u64] = &[1, 3, 6, 1, 4, 1, 58271, 1, 1];
-/// The same OID in dotted-string form, for matching parsed extensions.
-pub const SERVERPK_OID_STR: &str = "1.3.6.1.4.1.58271.1.1";
 
 /// How the client decides to trust a server's KEM public key.
 #[derive(Debug, Clone)]
@@ -31,17 +24,9 @@ pub enum ServerVerifier {
     },
 }
 
-fn extract_bound_server_pk(cert: &X509Certificate<'_>) -> Option<Vec<u8>> {
-    cert.extensions()
-        .iter()
-        .find(|e| e.oid.to_id_string() == SERVERPK_OID_STR)
-        .map(|e| e.value.to_vec())
-}
-
 impl ServerVerifier {
-    /// Verify that `server_pk` is acceptable given the presented `certificate`
-    /// (DER; empty if none).
-    pub fn verify(&self, server_pk: &[u8], certificate: &[u8]) -> Result<(), OrtError> {
+    /// Verify that the `certificate` is valid (DER; empty if none).
+    pub fn verify(&self, certificate: &[u8]) -> Result<(), OrtError> {
         let ca = match self {
             ServerVerifier::TrustOnFirstUse => return Ok(()),
             ServerVerifier::Strict { ca } => ca,
@@ -54,7 +39,9 @@ impl ServerVerifier {
             .map_err(|e| OrtError::Cert(format!("parse certificate: {e}")))?;
 
         if !cert.validity().is_valid() {
-            return Err(OrtError::Cert("certificate expired or not yet valid".into()));
+            return Err(OrtError::Cert(
+                "certificate expired or not yet valid".into(),
+            ));
         }
 
         match ca {
@@ -70,13 +57,38 @@ impl ServerVerifier {
             }
         }
 
-        let bound = extract_bound_server_pk(&cert)
-            .ok_or_else(|| OrtError::Cert("certificate has no ServerPK extension".into()))?;
-        if bound != server_pk {
-            return Err(OrtError::Cert(
-                "ServerHello public key does not match certificate binding".into(),
-            ));
-        }
         Ok(())
     }
+}
+
+/// Extract the server's signing public key from a DER certificate for Half-RTT
+/// signature verification. Returns (verifying_key_bytes, suite_id).
+pub fn extract_signing_key(certificate: &[u8]) -> Result<(Vec<u8>, ort_core::suite::SuiteId), OrtError> {
+    if certificate.is_empty() {
+        return Err(OrtError::Cert("certificate is empty".into()));
+    }
+
+    let (_, cert) = parse_x509_certificate(certificate)
+        .map_err(|e| OrtError::Cert(format!("parse certificate: {e}")))?;
+
+    // Extract the public key from the certificate's SubjectPublicKeyInfo
+    let spki = cert.public_key();
+    let pk_bytes = spki.subject_public_key.data.to_vec();
+
+    // Determine the signature suite based on the algorithm OID
+    let alg_oid = &spki.algorithm.algorithm;
+    let suite = if alg_oid.to_id_string() == "1.3.101.112" {
+        // Ed25519
+        ort_core::suite::SuiteId::X25519Ed25519
+    } else if alg_oid.to_id_string() == "2.16.840.1.101.3.4.3.17" {
+        // ML-DSA-65 (FIPS 204)
+        ort_core::suite::SuiteId::MlKem768MlDsa65
+    } else {
+        return Err(OrtError::Cert(format!(
+            "unsupported certificate signature algorithm: {}",
+            alg_oid
+        )));
+    };
+
+    Ok((pk_bytes, suite))
 }

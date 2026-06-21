@@ -23,6 +23,12 @@ pub enum OrtError {
     /// Server key confirmation (ServerAck ek_hash) mismatch.
     #[error("server key confirmation failed")]
     KeyConfirmation,
+    /// The server refused the connection (ServerReject) with a reason code.
+    #[error("server rejected the connection (reason {0})")]
+    Rejected(u8),
+    /// The server selected a suite the client did not offer/support.
+    #[error("server selected an unoffered suite: {0:#06x}")]
+    UnexpectedSuite(u16),
     /// Pinned server public key did not match (possible MITM).
     #[error("server public key pin mismatch")]
     PinMismatch,

@@ -1,8 +1,8 @@
 //! Minimal, explicit binary codec primitives.
 //!
-//! All integers are big-endian. Variable-length byte fields are length-prefixed
-//! with either a `u16` (handshake-sized blobs: keys, signatures, ciphertexts)
-//! or a `u32` (record payloads). Every read is bounds-checked.
+//! All integers are big-endian. Variable-length byte fields use a `u32` length
+//! prefix (handshake blobs and record payloads can exceed 64 KiB). Every read is
+//! bounds-checked; writes assert the field fits a `u32`.
 
 use crate::ProtoError;
 
@@ -60,16 +60,14 @@ impl Writer {
         self
     }
 
-    /// Write a `u16`-length-prefixed byte field.
-    pub fn bytes16(&mut self, b: &[u8]) -> &mut Self {
-        debug_assert!(b.len() <= u16::MAX as usize);
-        self.u16(b.len() as u16);
-        self.buf.extend_from_slice(b);
-        self
-    }
-
-    /// Write a `u32`-length-prefixed byte field.
-    pub fn bytes32(&mut self, b: &[u8]) -> &mut Self {
+    /// Write a `u32`-length-prefixed byte field. Panics only on the impossible
+    /// case of a field larger than 4 GiB (asserted, not `debug_assert`).
+    pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        assert!(
+            b.len() <= u32::MAX as usize,
+            "field length {} exceeds u32",
+            b.len()
+        );
         self.u32(b.len() as u32);
         self.buf.extend_from_slice(b);
         self
@@ -141,14 +139,10 @@ impl<'a> Reader<'a> {
         Ok(a)
     }
 
-    /// Read a `u16`-length-prefixed byte field.
-    pub fn bytes16(&mut self) -> Result<&'a [u8], ProtoError> {
-        let n = self.u16()? as usize;
-        self.take(n)
-    }
-
-    /// Read a `u32`-length-prefixed byte field.
-    pub fn bytes32(&mut self) -> Result<&'a [u8], ProtoError> {
+    /// Read a `u32`-length-prefixed byte field. The length is implicitly bounded
+    /// by the remaining buffer (which is itself capped by the outer frame size),
+    /// so this cannot over-allocate.
+    pub fn bytes(&mut self) -> Result<&'a [u8], ProtoError> {
         let n = self.u32()? as usize;
         self.take(n)
     }

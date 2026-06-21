@@ -1,10 +1,13 @@
-//! Key schedule: derive per-session keys from the KEM shared secret.
+//! Key schedule.
 //!
-//! Because the shared secret `k_sk` is fresh every connection (the client uses
-//! a fresh encapsulation seed `r`), the derived `enc_key`/`pool_key` are unique
-//! per session — there is no cross-session `(key, nonce)` reuse to worry about.
+//! Each connection (and each per-suite offer) derives its session keys directly
+//! from that suite's KEM shared secret `k_sk` and a fresh per-offer `nonce`:
+//! `enc_sk = HKDF(k_sk, salt = nonce)`. There is no key shared across suites
+//! (each offer's keys come only from its own KEM secret), and `k_sk` is fresh
+//! per connection (the client uses a fresh encapsulation seed), so the derived
+//! record keys are unique — no cross-session `(key, nonce)` reuse.
 
-use crate::suite::CipherSuite;
+use crate::prim;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// HKDF `info` label for the AEAD record key.
@@ -27,14 +30,12 @@ impl core::fmt::Debug for SessionKeys {
     }
 }
 
-/// Derive the session keys from the KEM shared secret and the on-wire
-/// ciphertext (which both peers see, and which binds the derivation to this
-/// specific encapsulation).
-pub fn derive_session_keys<S: CipherSuite>(k_sk: &[u8; 32], ciphertext: &[u8]) -> SessionKeys {
-    let salt = S::hash256(ciphertext);
+/// Derive the record-layer keys from the KEM shared secret `k_sk`, salted by the
+/// per-offer `nonce`.
+pub fn derive_session_keys(k_sk: &[u8; 32], nonce: &[u8; 32]) -> SessionKeys {
     let mut enc_key = [0u8; 32];
-    S::hkdf(k_sk, &salt, INFO_ENC_KEY, &mut enc_key);
+    prim::hkdf(k_sk, nonce, INFO_ENC_KEY, &mut enc_key);
     let mut pool_key = [0u8; 32];
-    S::hkdf(k_sk, &salt, INFO_POOL_KEY, &mut pool_key);
+    prim::hkdf(k_sk, nonce, INFO_POOL_KEY, &mut pool_key);
     SessionKeys { enc_key, pool_key }
 }
